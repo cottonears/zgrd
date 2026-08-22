@@ -1,7 +1,10 @@
 const std = @import("std");
+pub const calc = @import("calc.zig");
+pub const index = @import("index.zig");
+pub const square_tree = @import("square_tree.zig");
+pub const volume = @import("volume.zig");
+pub const svg = @import("svg.zig");
 
-// TODO: Build out the library's ABI in this file and test it from C.
-
-export fn add(a: i32, b: i32) i32 {
-    return a + b;
+test { // NOTE: here so build test run runs imported modules' tests.
+    std.testing.refAllDecls(@This());
 }

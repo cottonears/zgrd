@@ -1,502 +1,387 @@
 const std = @import("std");
-const calc = @import("calc.zig");
-const data = @import("data.zig");
-const svg = @import("svg.zig");
-const vol = @import("volume.zig");
-const fmt = std.fmt;
-const fs = std.fs;
-const os = std.os;
-const time = std.time;
-
+const builtin = @import("builtin");
+const zgrd = @import("zgrd");
+const calc = zgrd.calc;
+const index = zgrd.index;
+const st = zgrd.square_tree;
+const vol = zgrd.volume;
 const Vec2f = calc.Vec2f;
 const Ball2f = vol.Ball2f;
 const Box2f = vol.Box2f;
-const benchmark_len = 20000;
-const test_len = 1000;
+const Line2f = vol.Line2f;
+const OrientedBox2f = vol.OrientedBox2f;
+const timer = std.Io.Clock.awake;
+const max_capacity = 200_000;
+const min_trials = 5;
+const min_num_vols = 100;
+const usage_msg =
+    \\Usage: zgrd-bench [options]
+    \\  -i: Set an input file (csv) to load test volumes from (see readme for correct format)
+    \\  -p: String defining pdf used to generate test volume positions; default "N(5,2.5)"
+    \\      Parameters in parentheses for (N)ormal: (mean,std_dev).
+    \\      Parameters in parentheses for (U)niform: (min,max).
+    \\  -s: String for pdf used to generate test volumes sizes; default "U(0.001,0.05)"
+    \\  -t: Number of times to repeat each benchmark (for stable timing averages); default = 30
+    \\  -v: Number of volumes to generate (ignored if using -i); default = 20000 (2000 in debug)
+    \\
+;
+var input_file: ?[]const u8 = null;
+var output_dir: ?[]const u8 = null;
+var random_vols: vol.TestVolumes = undefined;
+var position_dist: calc.ProbDensityFunc = .{ .normal = .{ .mean = 5.0, .stddev = 1.5 } };
+var size_dist: calc.ProbDensityFunc = .{ .uniform = .{ .min = 0.001, .max = 0.05 } };
+var num_trials: u8 = 30;
+var num_vols: u24 = if (builtin.mode == .ReleaseFast) 20_000 else 2_000;
 
-var num_trials: u32 = 10;
-var random_floats: [benchmark_len]f32 = undefined;
-var random_vecs: [benchmark_len]Vec2f = undefined;
-var random_balls: [benchmark_len]Ball2f = undefined;
-var random_boxes: [benchmark_len]Box2f = undefined;
-var random_data_generated = false;
-
-pub fn main() !void {
-    if (os.argv.len > 1) {
-        const slice = std.mem.span(os.argv[1]);
-        num_trials = try fmt.parseInt(u16, slice, 0);
-    }
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    defer {
-        const check = gpa.deinit();
-        std.debug.print("gpa deinit check: {}\n", .{check});
-    }
-    try runAllBenchmarks(allocator);
+/// Fetches the value following a flag, erroring with the usage message if none was supplied.
+fn nextArgValue(args_iter: *std.process.Args.Iterator, flag: []const u8) ![:0]const u8 {
+    return args_iter.next() orelse {
+        std.debug.print("Missing value for '{s}'.\n{s}", .{ flag, usage_msg });
+        return error.MissingArgumentValue;
+    };
 }
 
-fn runAllBenchmarks(allocator: std.mem.Allocator) !void {
-    genRandomData(0);
-    std.debug.print("Running micro-benchmarks for {} bodies...\n", .{benchmark_len});
-    try benchmarkIndexing(allocator);
-    benchmarkOverlapChecks();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args_iter.deinit();
+    _ = args_iter.next(); // skip the program name
 
-    std.debug.print("\nRunning tree benchmarks for {} bodies...\n\n", .{benchmark_len});
-    try benchmarkSquareTree(2, 6, u8, Ball2f, allocator);
-    try benchmarkSquareTree(4, 3, u8, Ball2f, allocator);
-    try benchmarkSquareTree(2, 6, u8, Box2f, allocator);
-    try benchmarkSquareTree(4, 3, u8, Box2f, allocator);
-    std.debug.print("Benchmarks complete!\n", .{});
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-i")) {
+            const file = try nextArgValue(&args_iter, arg);
+            const cwd = std.Io.Dir.cwd();
+            cwd.access(init.io, file, .{ .read = true }) catch |err| {
+                std.debug.print("Unable to read from {s}\n", .{file});
+                return err;
+            };
+            input_file = file;
+        } else if (std.mem.eql(u8, arg, "-p")) {
+            const pdf_str = try nextArgValue(&args_iter, arg);
+            position_dist = calc.ProbDensityFunc.fromPdfString(pdf_str) catch {
+                std.debug.print("Could not parse pdf string '{s}':\n{s}", .{ pdf_str, usage_msg });
+                return error.InvalidPdfArgument;
+            };
+        } else if (std.mem.eql(u8, arg, "-s")) {
+            const pdf_str = try nextArgValue(&args_iter, arg);
+            size_dist = calc.ProbDensityFunc.fromPdfString(pdf_str) catch {
+                std.debug.print("Could not parse pdf string '{s}':\n{s}", .{ pdf_str, usage_msg });
+                return error.InvalidPdfArgument;
+            };
+        } else if (std.mem.eql(u8, arg, "-t")) {
+            const val_str = try nextArgValue(&args_iter, arg);
+            num_trials = std.fmt.parseInt(u8, val_str, 10) catch {
+                std.debug.print("Could not parse trial count '{s}':\n{s}", .{ val_str, usage_msg });
+                return error.InvalidTrialCount;
+            };
+        } else if (std.mem.eql(u8, arg, "-v")) {
+            const val_str = try nextArgValue(&args_iter, arg);
+            num_vols = std.fmt.parseInt(u24, val_str, 10) catch {
+                std.debug.print("Could not parse volume count '{s}':\n{s}", .{ val_str, usage_msg });
+                return error.InvalidVolumeCount;
+            };
+        } else {
+            std.debug.print("Unrecognised argument '{s}'.\n{s}", .{ arg, usage_msg });
+            return error.UnrecognisedArgument;
+        }
+    }
+    if (num_trials < min_trials) {
+        std.debug.print(
+            "Requested {} trials is below the minimum required ({}).\n{s}",
+            .{ num_trials, min_trials, usage_msg },
+        );
+        return error.TooFewTrials;
+    }
+
+    if (input_file) |file| {
+        random_vols = try vol.TestVolumes.initCsv(allocator, init.io, file);
+        std.debug.print("Running index/overlap micro-benchmarks using volumes loaded from '{s}'...\n", .{file});
+    } else {
+        if (min_num_vols > num_vols or num_vols > max_capacity) {
+            std.debug.print(
+                "Requested {} volumes outside supported range ({} - {}).\n{s}",
+                .{ num_vols, min_num_vols, max_capacity, usage_msg },
+            );
+            return error.InvalidNumberVolumes;
+        }
+
+        var prng = std.Random.DefaultPrng.init(0);
+        random_vols = try vol.TestVolumes.initRandom(
+            allocator,
+            prng.random(),
+            num_vols,
+            size_dist,
+            position_dist,
+        );
+        std.debug.print("Running index/overlap micro-benchmarks for {} vols...\n", .{num_vols});
+    }
+    defer random_vols.deinit(allocator);
+
+    try benchmarkIndexing(allocator, init.io);
+    benchmarkOverlapChecks(init.io);
+    try benchmarkSquareTrees(allocator, init.io);
 }
 
-fn benchmarkOverlapChecks() void {
+fn benchmarkSquareTrees(allocator: std.mem.Allocator, io: std.Io) !void {
+    inline for (.{ Ball2f, Box2f }) |V| {
+        std.debug.print(
+            "\nRunning tree benchmarks for {d} {any}...\n",
+            .{ random_vols.getRandomBodies(V).len, V },
+        );
+        std.debug.print(
+            "\n| Indexer type     | size  | overlaps | max leafs | add (ns) | update (ns) | overlap (ns) | tick (ms) |\n",
+            .{},
+        );
+        const indexer_types = .{
+            index.Indexer2f(2, 1, 3, .Morton),
+            index.Indexer2f(2, 1, 4, .Morton),
+            index.Indexer2f(2, 1, 5, .Morton),
+            index.Indexer2f(2, 3, 3, .Morton),
+            index.Indexer2f(2, 6, 0, .Morton),
+            index.Indexer2f(2, 1, 6, .Morton),
+            index.Indexer2f(2, 4, 3, .Morton),
+            index.Indexer2f(2, 1, 7, .Morton),
+            index.Indexer2f(2, 1, 8, .Morton),
+            index.Indexer2f(4, 1, 1, .Morton),
+            index.Indexer2f(4, 1, 2, .Morton),
+            index.Indexer2f(4, 3, 0, .Morton),
+            index.Indexer2f(4, 1, 3, .Morton),
+            index.Indexer2f(4, 4, 0, .Morton),
+            index.Indexer2f(4, 1, 4, .Morton),
+            index.Indexer2f(4, 1, 1, .Zigzag),
+            index.Indexer2f(4, 1, 2, .Zigzag),
+            index.Indexer2f(4, 2, 1, .Zigzag),
+            index.Indexer2f(4, 3, 0, .Zigzag),
+            index.Indexer2f(4, 1, 3, .Zigzag),
+            index.Indexer2f(4, 2, 2, .Zigzag),
+            index.Indexer2f(4, 1, 4, .Zigzag),
+        };
+        inline for (indexer_types) |Indexer| {
+            const bench_results = try benchMarkTree(st.SquareTree(Indexer, V, u32), V, allocator, io);
+            printBenchmarkRow(indexerLabel(Indexer), bench_results);
+        }
+    }
+}
+
+/// Names an indexer as "<curve> <cells per axis> x <effective depth> [<levels>]".
+fn indexerLabel(comptime Indexer: type) []const u8 {
+    return std.fmt.comptimePrint("{s} {d} x {d} [{d}]", .{
+        @tagName(Indexer.curve),
+        Indexer.base,
+        Indexer.effective_depth,
+        Indexer.depth,
+    });
+}
+
+/// Prints one benchmark result as a row matching the table header printed in main.
+fn printBenchmarkRow(name: []const u8, stats: BenchmarkStats) void {
+    std.debug.print(
+        "| {s:<16} | {d:>3} B | {d:>8} |  {d:>5}  | {d:>8.3} | {d:>11.3} | {d:>12.3} | {d:>9.3} |\n",
+        .{
+            name,
+            stats.struct_size,
+            stats.overlaps,
+            stats.max_leaf,
+            stats.ns_add,
+            stats.ns_update,
+            stats.ns_overlap,
+            stats.ms_tick,
+        },
+    );
+}
+
+fn elapsedNs(t1: std.Io.Timestamp, t2: std.Io.Timestamp) f64 {
+    return @floatFromInt(std.Io.Timestamp.durationTo(t1, t2).toNanoseconds());
+}
+
+// TODO: format nicely and add average at bottom of table
+fn benchmarkIndexing(allocator: std.mem.Allocator, io: std.Io) !void {
+    const IndexerTypes = [_]type{
+        index.Indexer2f(2, 1, 2, index.Curve.Morton),
+        index.Indexer2f(2, 1, 3, index.Curve.Morton),
+        index.Indexer2f(2, 1, 4, index.Curve.Morton),
+        index.Indexer2f(2, 1, 5, index.Curve.Morton),
+        index.Indexer2f(2, 1, 6, index.Curve.Morton),
+        index.Indexer2f(2, 1, 7, index.Curve.Morton),
+        index.Indexer2f(4, 1, 1, index.Curve.Morton),
+        index.Indexer2f(4, 1, 2, index.Curve.Spring),
+        index.Indexer2f(4, 1, 3, index.Curve.Zigzag),
+        index.Indexer2f(4, 1, 4, index.Curve.Zigzag),
+    };
+    inline for (IndexerTypes) |Indexer| {
+        const pt1 = random_vols.balls.items[0].centre;
+        const pt2 = random_vols.balls.items[1].centre;
+        var indexer = try Indexer.init(pt1, pt2);
+        var indexes = try allocator.alloc(Indexer.CurveIndex, random_vols.boxes.items.len);
+        defer allocator.free(indexes);
+        var index_sum: f64 = 0;
+
+        const t_0 = timer.now(io);
+        for (random_vols.boxes.items, 0..) |b, i| {
+            const index_of_b = indexer.getLeafIndexForPoint(b.getCentre());
+            index_sum += @as(f64, @floatFromInt(index_of_b));
+            indexes[i] = index_of_b;
+        }
+        const t_1 = timer.now(io);
+
+        // compute a sum of the inter-leaf distances
+        var index_dist_sum: f64 = 0;
+        var last_centre = indexer.getLeafCellBoundary(0).getCentre();
+        for (1..Indexer.num_leaves) |i| {
+            const centre_i = indexer.getLeafCellBoundary(@truncate(i)).getCentre();
+            index_dist_sum += calc.norm(centre_i - last_centre);
+            last_centre = centre_i;
+        }
+        const avg_inter_leaf_dist = index_dist_sum / @as(f64, @floatFromInt(Indexer.num_leaves - 1));
+        const avg_index_time = elapsedNs(t_0, t_1) / @as(f64, @floatFromInt(random_vols.boxes.items.len));
+        std.debug.print(
+            "{s}: point indexing took {d:.3} ns/point; avg_inter_leaf_dist = {d:.4}\n",
+            .{ indexerLabel(Indexer), avg_index_time, avg_inter_leaf_dist },
+        );
+    }
+}
+
+// TODO: format nicely and add average at bottom of table
+fn benchmarkOverlapChecks(io: std.Io) void {
+    const trials: usize = num_trials;
+    const half_trials = (trials + 1) / 2; // rounds up, so a trial count of 1 still runs the mixed check once
     var overlap_count_1: u32 = 0;
     var overlap_count_2: u32 = 0;
     var overlap_count_3: u32 = 0;
+    var overlap_count_4: u32 = 0;
+    var overlap_count_5: u32 = 0;
 
-    const t_0 = time.microTimestamp();
-    var first_ball = random_balls[0];
+    const t_0 = timer.now(io);
+    var first_ball = random_vols.balls.items[0];
     first_ball.radius = first_ball.radius * 25;
-    for (0..num_trials) |_| {
-        for (random_balls) |b| {
+    for (0..trials) |_| {
+        for (random_vols.balls.items) |b| {
             const overlap = vol.checkVolumesOverlap(first_ball, b);
             overlap_count_1 += if (overlap) 1 else 0;
         }
     }
-    const t_1 = time.microTimestamp();
+    const t_1 = timer.now(io);
 
-    var first_box = random_boxes[0];
-    first_box.half_width = first_box.half_width * 25;
-    first_box.half_height = first_box.half_height * 25;
-    for (0..num_trials) |_| {
-        for (random_boxes) |b| {
-            const overlap = vol.checkVolumesOverlap(first_box, b);
+    const first_box = random_vols.boxes.items[0];
+    const query_box = first_box.getScaled(25);
+    for (0..trials) |_| {
+        for (random_vols.boxes.items) |b| {
+            const overlap = vol.checkVolumesOverlap(query_box, b);
             overlap_count_2 += if (overlap) 1 else 0;
         }
     }
-    const t_2 = time.microTimestamp();
+    const t_2 = timer.now(io);
 
-    for (0..num_trials / 2) |_| {
-        for (random_balls) |b| {
-            const overlap = vol.checkVolumesOverlap(first_box, b);
+    for (0..half_trials) |_| {
+        for (random_vols.balls.items) |b| {
+            const overlap = vol.checkVolumesOverlap(query_box, b);
             overlap_count_3 += if (overlap) 1 else 0;
         }
-        for (random_boxes) |b| {
+        for (random_vols.boxes.items) |b| {
             const overlap = vol.checkVolumesOverlap(first_ball, b);
             overlap_count_3 += if (overlap) 1 else 0;
         }
     }
-    const t_3 = time.microTimestamp();
+    const t_3 = timer.now(io);
+
+    const query_obb = random_vols.oriented_boxes.items[0].getScaled(25);
+    for (0..trials) |_| {
+        for (random_vols.boxes.items) |b| {
+            const overlap = vol.checkVolumesOverlap(query_obb, b);
+            overlap_count_4 += if (overlap) 1 else 0;
+        }
+    }
+    const t_4 = timer.now(io);
+
+    const query_line = Line2f{ .start = first_box.min, .end = first_box.max };
+    for (0..trials) |_| {
+        for (random_vols.boxes.items) |b| {
+            const overlap = vol.checkVolumesOverlap(query_line, b);
+            overlap_count_5 += if (overlap) 1 else 0;
+        }
+    }
+    const t_5 = timer.now(io);
 
     std.debug.print(
-        "Overlapping intervals benchmark: found {}/{}/{} overlaps.\n",
-        .{ overlap_count_1, overlap_count_2, overlap_count_3 },
+        "Overlaps benchmark: found {}/{}/{}/{}/{} overlaps.\n",
+        .{ overlap_count_1, overlap_count_2, overlap_count_3, overlap_count_4, overlap_count_5 },
     );
+
+    const ball_checks: f64 = @floatFromInt(trials * random_vols.balls.items.len);
+    const box_checks: f64 = @floatFromInt(trials * random_vols.boxes.items.len);
+    const mixed_checks: f64 = @floatFromInt(
+        half_trials * (random_vols.balls.items.len + random_vols.boxes.items.len),
+    );
+    const obb_box_checks: f64 = @floatFromInt(trials * random_vols.boxes.items.len);
+    const line_box_checks: f64 = @floatFromInt(trials * random_vols.boxes.items.len);
     std.debug.print(
-        "Balls took {} us; boxes took {} us; ball-box took {} us.\n",
-        .{ t_1 - t_0, t_2 - t_1, t_3 - t_2 },
+        "Average check time (ns/op): balls {d:.3}; boxes {d:.3}; ball-box {d:.3}; obb-box {d:.3}; line-box {d:.3}.\n",
+        .{
+            elapsedNs(t_0, t_1) / ball_checks,
+            elapsedNs(t_1, t_2) / box_checks,
+            elapsedNs(t_2, t_3) / mixed_checks,
+            elapsedNs(t_3, t_4) / obb_box_checks,
+            elapsedNs(t_4, t_5) / line_box_checks,
+        },
     );
 }
 
-fn benchmarkSquareTree(
-    comptime base_num: u4,
-    comptime depth: u4,
-    comptime DataIndex: type,
+// TODO: add average at bottom of table
+/// Average timings for one grid configuration + a simulated frame's cost
+const BenchmarkStats = struct {
+    ns_add: f64,
+    ns_update: f64,
+    ns_overlap: f64,
+    ms_tick: f64,
+    max_leaf: u16,
+    overlaps: usize,
+    struct_size: usize,
+};
+
+fn benchMarkTree(
+    comptime TreeType: type,
     comptime VolumeType: type,
     allocator: std.mem.Allocator,
-) !void {
-    const TreeType = data.SquareGridStatic(base_num, depth, DataIndex, VolumeType);
-    var type_info_buff: [512]u8 = undefined;
-    const type_info = try TreeType.getTypeInfo(&type_info_buff);
-    std.debug.print("{s}", .{type_info});
-    const leaf_cap = 2 * benchmark_len / TreeType.num_nodes;
-    var qt = try TreeType.init(allocator, leaf_cap, Vec2f{ 0, 0 }, 1.0);
-    defer qt.deinit();
+    io: std.Io,
+) !BenchmarkStats {
+    var tree = try TreeType.init(allocator, Vec2f{ 0, 0 }, Vec2f{ 10, 10 }, max_capacity);
+    defer tree.deinit(allocator);
+    const bodies = random_vols.getRandomBodies(VolumeType);
+    const overlap_buff = try allocator.alloc(TreeType.OverlapPair, 1024 * bodies.len);
+    var entity_indexes = try allocator.alloc(TreeType.ClientIdType, bodies.len);
+    var overlaps: usize = 0;
+    var ns_add: f64 = 0;
+    var ns_update: f64 = 0;
+    var ns_query_idx: f64 = 0;
 
-    const random_bodies = getRandomBodies(VolumeType);
-    var body_indexes: [benchmark_len]TreeType.VolumeIndex = undefined;
-    var overlap_buff: [2 * benchmark_len]TreeType.VolumeIndex = undefined;
-    var overlap_count_1: u32 = 0;
-    var overlap_count_2: u32 = 0;
-
-    const t_0 = time.microTimestamp();
     for (0..num_trials) |_| {
-        qt.clearStoredVolumes();
-        for (random_bodies, 0..) |ball, i| body_indexes[i] = try qt.addVolume(ball);
-    }
-    const t_1 = time.microTimestamp();
-    for (0..num_trials) |_| {
-        qt.updateBounds();
-    }
-    const t_2 = time.microTimestamp();
-    for (0..num_trials) |_| {
-        for (random_bodies) |b| {
-            const overlaps_found = qt.findOverlaps(&overlap_buff, b);
-            overlap_count_1 += @truncate(overlaps_found.len);
-        }
-    }
-    const t_3 = time.microTimestamp();
-    for (0..num_trials) |_| {
-        for (body_indexes) |i| {
-            const overlaps_found = qt.findOverlapsFromIndex(&overlap_buff, i);
-            overlap_count_2 += @truncate(overlaps_found.len);
-        }
-    }
-    const t_4 = time.microTimestamp();
+        const t_0 = timer.now(io);
 
-    const scale_to_avg_ms = 1.0 / (calc.asf32(num_trials) * 1000.0);
-    const add_ms = scale_to_avg_ms * calc.asf32(t_1 - t_0);
-    const update_ms = scale_to_avg_ms * calc.asf32(t_2 - t_1);
-    const overlap1_ms = scale_to_avg_ms * calc.asf32(t_3 - t_2);
-    const overlap2_ms = scale_to_avg_ms * calc.asf32(t_4 - t_3);
-    std.debug.print(
-        "Benchmark results for {} {}s: method 1 found {} overlaps, method 2 found {} overlaps.\n",
-        .{ qt.num_bodies, VolumeType, overlap_count_1 / num_trials, overlap_count_2 / num_trials },
-    );
-    std.debug.print(
-        "Average times: add = {d:.3} ms, update = {d:.3} ms , overlap 1 = {d:.3} ms, overlap 2 = {d:.3} ms.\n\n",
-        .{ add_ms, update_ms, overlap1_ms, overlap2_ms },
-    );
-}
+        tree.clearStoredVolumes();
+        for (0..entity_indexes.len) |i| entity_indexes[i] = @intCast(i);
+        try tree.addVolumes(bodies, entity_indexes);
+        const t_1 = timer.now(io);
 
-fn benchmarkIndexing(allocator: std.mem.Allocator) !void {
-    const Tree16x2 = data.SquareGridStatic(4, 2, u8, Ball2f);
-    var ht = try Tree16x2.init(allocator, 8, Vec2f{ 0, 0 }, 1.0);
-    defer ht.deinit();
-    var ln_sum_1: usize = 0;
-    var ln_sum_2: usize = 0;
+        tree.updateBounds();
+        const t_2 = timer.now(io);
 
-    const t_0 = time.microTimestamp();
-    for (0..num_trials) |_| {
-        for (0..benchmark_len) |i| ln_sum_1 += ht.getLeafIndexForPoint(random_vecs[i]);
+        overlaps += (try tree.findSelfOverlaps(overlap_buff)).len;
+        const t_3 = timer.now(io);
+
+        ns_add += elapsedNs(t_0, t_1);
+        ns_update += elapsedNs(t_1, t_2);
+        ns_query_idx += elapsedNs(t_2, t_3);
     }
-    const t_1 = time.microTimestamp();
-    for (0..num_trials) |_| {
-        for (0..benchmark_len) |i| ln_sum_2 += ht.getNodeIndexForPoint(Tree16x2.depth - 1, random_vecs[i]);
-    }
-    const t_2 = time.microTimestamp();
 
-    std.debug.print(
-        "Index benchmark: indexed {} points in {}/{} us. Leaf index sums = {}/{}.\n",
-        .{ num_trials * benchmark_len, t_1 - t_0, t_2 - t_1, ln_sum_1, ln_sum_2 },
-    );
-}
-
-fn getRandUniform(rng: *std.rand.Xoshiro256, min: f32, max: f32) f32 {
-    return min + (max - min) * rng.random().float(f32);
-}
-
-fn genRandomData(seed: usize) void {
-    var rng = std.rand.Xoshiro256.init(seed);
-    for (0..benchmark_len) |i| random_floats[i] = getRandUniform(&rng, 0, 1);
-    for (0..benchmark_len) |i| {
-        const x_index = (i + 2) % benchmark_len;
-        const y_index = (i + 7) % benchmark_len;
-        const radius = 0.004 * random_floats[i];
-        const half_width = if (i % 2 == 0) 0.7854 * radius else radius;
-        const half_height = if (i % 2 != 0) 0.7854 * radius else radius;
-        random_vecs[i] = Vec2f{ random_floats[x_index], random_floats[y_index] };
-        random_balls[i] = Ball2f{
-            .centre = random_vecs[i],
-            .radius = radius,
-        };
-        random_boxes[i] = Box2f{
-            .centre = random_vecs[i],
-            .half_width = half_width,
-            .half_height = half_height,
-        };
-    }
-    random_data_generated = true;
-}
-
-fn getRandomBodies(comptime T: type) []T {
-    return switch (T) {
-        Ball2f => &random_balls,
-        Box2f => &random_boxes,
-        else => unreachable,
+    const ns_total = (ns_add + ns_update + ns_query_idx);
+    const checks: f64 = @floatFromInt(bodies.len * num_trials);
+    return .{
+        .ns_add = ns_add / checks,
+        .ns_update = ns_update / checks,
+        .ns_overlap = ns_query_idx / checks,
+        .ms_tick = ns_total / @as(f64, @floatFromInt(@as(u32, num_trials) * 1_000_000)),
+        .max_leaf = tree.maxLeafOccupancy(),
+        .overlaps = overlaps / num_trials,
+        .struct_size = @sizeOf(TreeType),
     };
-}
-
-// integration tests below
-const testing = std.testing;
-const out_dir_name = "test-out";
-const canvas_width = 1000;
-const canvas_height = 1000;
-const canvas_scale = 400;
-const palette_size = 9;
-const tolerance = 0.00001;
-var dashed_styles: [palette_size]svg.ShapeStyle = undefined;
-var solid_styles: [palette_size]svg.ShapeStyle = undefined;
-var test_canvas: svg.Canvas = undefined;
-
-const BallGrid = data.SquareGridStatic(4, 2, u16, Ball2f);
-var ball_grid: BallGrid = undefined;
-const BoxGrid = data.SquareGridStatic(4, 2, u16, Box2f);
-var box_grid: BoxGrid = undefined;
-
-fn initTesting(delete_out_dir: bool) !void {
-    if (!random_data_generated) { // generate random data for tests
-        genRandomData(0);
-        dashed_styles[0] = svg.ShapeStyle{ .stroke_hsl = [_]u9{ 0, 0, 0 }, .stroke_dashed = true };
-        solid_styles[0] = svg.ShapeStyle{ .stroke_hsl = [_]u9{ 0, 0, 0 } };
-        var palette = try svg.RandomHslPalette.init(std.testing.allocator, palette_size - 1);
-        for (1.., palette.hsl_colours) |i, hsl| {
-            dashed_styles[i] = svg.ShapeStyle{ .stroke_hsl = hsl, .stroke_dashed = true };
-            solid_styles[i] = svg.ShapeStyle{ .stroke_hsl = hsl };
-        }
-        palette.deinit();
-    }
-    if (delete_out_dir) { // delete test-out and create a new copy
-        var cwd = fs.cwd();
-        std.debug.print("Creating fresh {s} directory...\n", .{out_dir_name});
-        try cwd.deleteTree(out_dir_name);
-        try cwd.makeDir(out_dir_name);
-    }
-    // create new canvas + grid
-    test_canvas = try svg.Canvas.init(std.testing.allocator, canvas_width, canvas_height, canvas_scale);
-    ball_grid = try BallGrid.init(testing.allocator, 16, Vec2f{ 0, 0 }, 1.0);
-    box_grid = try BoxGrid.init(testing.allocator, 16, Vec2f{ 0, 0 }, 1.0);
-}
-
-fn deinitTesting() void {
-    test_canvas.deinit();
-    ball_grid.deinit();
-    box_grid.deinit();
-}
-
-fn getNodeLabel(buff: []u8, lvl: u8, index: u32) ![]const u8 {
-    return switch (lvl) {
-        0 => try std.fmt.bufPrint(buff, "{X:0>1}", .{index}),
-        1 => try std.fmt.bufPrint(buff, "{X:0>2}", .{index}),
-        2 => try std.fmt.bufPrint(buff, "{X:0>3}", .{index}),
-        3 => try std.fmt.bufPrint(buff, "{X:0>4}", .{index}),
-        4 => try std.fmt.bufPrint(buff, "{X:0>5}", .{index}),
-        else => unreachable,
-    };
-}
-
-test "draw encompassing balls" {
-    try initTesting(true);
-    defer deinitTesting();
-    for (0..test_len / 20) |i| {
-        const a = Ball2f{
-            .centre = random_vecs[3 * i],
-            .radius = 0.25 * random_floats[7 * i],
-        };
-        const b = Ball2f{
-            .centre = random_vecs[11 * i],
-            .radius = 0.25 * random_floats[13 * i],
-        };
-        const c = vol.getEncompassingVolume(Ball2f, a, b);
-        try test_canvas.addCircle(testing.allocator, a.centre, a.radius, solid_styles[1]);
-        try test_canvas.addCircle(testing.allocator, b.centre, b.radius, solid_styles[3]);
-        try test_canvas.addCircle(testing.allocator, c.centre, c.radius, dashed_styles[7]);
-        // write an image to file
-        var fname_buff: [128]u8 = undefined;
-        const fpath = try fmt.bufPrint(
-            &fname_buff,
-            "{s}/encompassing-balls-{}.html",
-            .{ out_dir_name, i + 1 },
-        );
-        try test_canvas.writeHtml(testing.allocator, fpath, true);
-    }
-}
-
-test "draw encompassing boxes" {
-    try initTesting(false);
-    defer deinitTesting();
-    for (0..test_len / 100) |i| {
-        const a = Box2f{
-            .centre = random_vecs[3 * i],
-            .half_width = 0.25 * random_floats[5 * i],
-            .half_height = 0.25 * random_floats[7 * i],
-        };
-        const b = Box2f{
-            .centre = random_vecs[11 * i],
-            .half_width = 0.25 * random_floats[13 * i],
-            .half_height = 0.25 * random_floats[17 * i],
-        };
-        const c = vol.getEncompassingVolume(Box2f, a, b);
-        const corners_a = a.getCorners();
-        const corners_b = b.getCorners();
-        const corners_c = c.getCorners();
-        try test_canvas.addRectangle(testing.allocator, corners_a[0], corners_a[1], solid_styles[1]);
-        try test_canvas.addRectangle(testing.allocator, corners_b[0], corners_b[1], solid_styles[3]);
-        try test_canvas.addRectangle(testing.allocator, corners_c[0], corners_c[1], dashed_styles[7]);
-        // write an image to file
-        var fname_buff: [128]u8 = undefined;
-        const fpath = try fmt.bufPrint(
-            &fname_buff,
-            "{s}/encompassing-boxes-{}.html",
-            .{ out_dir_name, i + 1 },
-        );
-        try test_canvas.writeHtml(testing.allocator, fpath, true);
-    }
-}
-
-test "draw ball grid" {
-    try initTesting(false);
-    defer deinitTesting();
-
-    // create an svg canvas depicting the grid structure
-    var text_buff: [16]u8 = undefined;
-    for (BallGrid.reverse_levels) |lvl| {
-        var style = solid_styles[(2 * lvl) % palette_size];
-        style.stroke_width = @truncate(BallGrid.depth - lvl);
-        const font_size: u8 = 6 + 4 * (BallGrid.depth - lvl);
-        const lvl_end_index = BallGrid.nodes_in_level[lvl];
-        for (0..lvl_end_index) |i| {
-            const index: BallGrid.NodeNumber = @intCast(i);
-            const node_origin = try ball_grid.getNodeOrigin(lvl, index);
-            const node_centre = try ball_grid.getNodeCentre(lvl, index);
-            const node_corner = try ball_grid.getNodeCorner(lvl, index);
-            const node_label = try getNodeLabel(&text_buff, lvl, index);
-            try test_canvas.addRectangle(testing.allocator, node_origin, node_corner, style);
-            try test_canvas.addText(testing.allocator, node_centre, node_label, font_size, style.stroke_hsl);
-        }
-    }
-
-    //  add some data to the test grid and record indexes of all bodies that overlap with others
-    var body_indexes: [test_len]BallGrid.VolumeIndex = undefined;
-    for (0.., random_balls[0..test_len]) |i, b| body_indexes[i] = try ball_grid.addVolume(b);
-    ball_grid.updateBounds();
-    var overlap_set = std.AutoHashMap(BallGrid.VolumeIndex, void).init(testing.allocator);
-    defer overlap_set.deinit();
-    for (body_indexes) |i| {
-        var overlap_buff: [test_len]BallGrid.VolumeIndex = undefined;
-        const overlaps_found = ball_grid.findOverlapsFromIndex(&overlap_buff, i);
-        if (overlaps_found.len == 0) continue;
-        try overlap_set.put(i, {});
-        for (overlaps_found) |j| try overlap_set.put(j, {});
-    }
-
-    // draw circles on the canvas; write SVG file.
-    for (body_indexes) |i| {
-        const body = ball_grid.getVolume(i) orelse unreachable;
-        const style = if (overlap_set.contains(i)) solid_styles[6] else solid_styles[8];
-        try test_canvas.addCircle(testing.allocator, body.centre, body.radius, style);
-    }
-    var fname_buff: [128]u8 = undefined;
-    const fpath = try fmt.bufPrint(
-        &fname_buff,
-        "{s}/ball-grid-{}-{}.html",
-        .{ out_dir_name, BallGrid.base, BallGrid.depth },
-    );
-    try test_canvas.writeHtml(testing.allocator, fpath, true);
-}
-
-test "draw box grid" {
-    try initTesting(false);
-    defer deinitTesting();
-
-    // create an svg canvas depicting the grid structure
-    var text_buff: [16]u8 = undefined;
-    for (BoxGrid.reverse_levels) |lvl| {
-        var style = solid_styles[(2 * lvl) % palette_size];
-        style.stroke_width = @truncate(BoxGrid.depth - lvl);
-        const font_size: u8 = 6 + 4 * (BoxGrid.depth - lvl);
-        const lvl_end_index = BoxGrid.nodes_in_level[lvl];
-        for (0..lvl_end_index) |i| {
-            const index: BoxGrid.NodeNumber = @intCast(i);
-            const node_origin = try box_grid.getNodeOrigin(lvl, index);
-            const node_centre = try box_grid.getNodeCentre(lvl, index);
-            const node_corner = try box_grid.getNodeCorner(lvl, index);
-            const node_label = try getNodeLabel(&text_buff, lvl, index);
-            try test_canvas.addRectangle(testing.allocator, node_origin, node_corner, style);
-            try test_canvas.addText(testing.allocator, node_centre, node_label, font_size, style.stroke_hsl);
-        }
-    }
-
-    //  add some data to the test grid and record indexes of all bodies that overlap with others
-    var body_indexes: [test_len]BoxGrid.VolumeIndex = undefined;
-    for (0.., random_boxes[0..test_len]) |i, b| body_indexes[i] = try box_grid.addVolume(b);
-    box_grid.updateBounds();
-    var overlap_set = std.AutoHashMap(BoxGrid.VolumeIndex, void).init(testing.allocator);
-    defer overlap_set.deinit();
-    for (body_indexes) |i| {
-        var overlap_buff: [test_len]BoxGrid.VolumeIndex = undefined;
-        const overlaps_found = box_grid.findOverlapsFromIndex(&overlap_buff, i);
-        if (overlaps_found.len == 0) continue;
-        try overlap_set.put(i, {});
-        for (overlaps_found) |j| try overlap_set.put(j, {});
-    }
-
-    // draw rectangles on the canvas; write SVG file.
-    for (body_indexes) |i| {
-        const box = box_grid.getVolume(i) orelse unreachable;
-        const box_corners = box.getCorners();
-        const style = if (overlap_set.contains(i)) solid_styles[6] else solid_styles[8];
-        try test_canvas.addRectangle(testing.allocator, box_corners[0], box_corners[1], style);
-    }
-    var fname_buff: [128]u8 = undefined;
-    const fpath = try fmt.bufPrint(
-        &fname_buff,
-        "{s}/box-grid-{}-{}.html",
-        .{ out_dir_name, BoxGrid.base, BoxGrid.depth },
-    );
-    try test_canvas.writeHtml(testing.allocator, fpath, true);
-}
-
-test "integration test 1" {
-    try initTesting(false);
-    defer deinitTesting();
-
-    // check the random points are indexed correctly
-    const leaf_size = ball_grid.size_per_level[BallGrid.depth - 1];
-    const max_dist_expected = 0.5 * @sqrt(2 * (leaf_size * leaf_size));
-    var max_dist_found: f32 = 0.0;
-    for (0..test_len) |i| {
-        const point = random_vecs[i];
-        const index = ball_grid.getLeafIndexForPoint(point);
-        const centre = try ball_grid.getNodeCentre(BallGrid.depth - 1, index);
-        const dist = calc.norm(point - centre);
-        if (dist > max_dist_expected) {
-            std.debug.print(
-                "{}. query point = {d:.3}; index = {X}, node-centre = {d:.3}, distance = {d:.4}\n",
-                .{ i, point, index, centre, dist },
-            );
-        }
-        max_dist_found = @max(dist, max_dist_found);
-    }
-    std.debug.print(
-        "max distance found was {d:.4} (expected limit = {d:.4})\n",
-        .{ max_dist_found, max_dist_expected },
-    );
-    try testing.expect(max_dist_found < max_dist_expected + tolerance);
-
-    // store some random points in the grid
-    var body_indexes: [test_len]BallGrid.VolumeIndex = undefined;
-    for (0..test_len) |i| body_indexes[i] = try ball_grid.addVolume(random_balls[i]);
-    ball_grid.updateBounds();
-
-    // find the overlapping bodies and record their indexes
-    var overlap_set_1 = std.AutoHashMap(BallGrid.VolumeIndex, void).init(testing.allocator);
-    defer overlap_set_1.deinit();
-    for (body_indexes) |i| {
-        var buff: [test_len]BallGrid.VolumeIndex = undefined;
-        const overlaps_found = ball_grid.findOverlapsFromIndex(&buff, i);
-        if (overlaps_found.len > 0) {
-            try overlap_set_1.put(i, {});
-            for (overlaps_found) |j| try overlap_set_1.put(j, {});
-        }
-    }
-
-    // find overlaps using the alternative function
-    var overlap_set_2 = std.AutoHashMap(BallGrid.VolumeIndex, void).init(testing.allocator);
-    defer overlap_set_2.deinit();
-    for (random_balls[0..test_len], body_indexes) |b, i| {
-        var buff: [test_len]BallGrid.VolumeIndex = undefined;
-        const overlaps_found = ball_grid.findOverlaps(&buff, b);
-        if (overlaps_found.len > 0) {
-            for (overlaps_found) |j| {
-                if (i.leaf_num == j.leaf_num and i.data_index == j.data_index) continue;
-                try overlap_set_2.put(j, {});
-            }
-        }
-    }
-
-    // cross-check overlap results for consistency
-    var iter_1 = overlap_set_1.keyIterator();
-    while (iter_1.next()) |i| try testing.expect(overlap_set_2.contains(i.*));
-    try testing.expectEqual(overlap_set_1.count(), overlap_set_2.count());
 }

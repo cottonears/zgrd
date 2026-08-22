@@ -1,4 +1,6 @@
 .zig-cache
-build.zig.zon
 test-out
 zig-out
+zig-pkg
+scratch
+*.o
