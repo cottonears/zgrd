@@ -35,6 +35,7 @@ pub fn SquareTree(
         pub const nodes_in_level = Indexer.nodes_in_level;
         pub const num_leaves = Indexer.num_leaves;
         pub const OverlapPair = [2]ClientId;
+        pub const Neighbour = struct { id: ClientId, dist: f32 };
         pub const VolumeType = Volume;
         pub const ClientIdType = ClientId;
         pub const compressed = Indexer.top_levels > 1;
@@ -226,6 +227,19 @@ pub fn SquareTree(
                 }
             }
             return res_list.getItems();
+        }
+
+        /// Finds up to `res_buff.len` stored volumes nearest to a point, nearest-first.
+        /// Search stops when buffer is full or there are no more candidates within `max_dist`.
+        /// Requires `updateBounds` to have been called since the last `addVolume`.
+        pub fn findNearestNeighbours(
+            self: *const Self,
+            res_buff: []Neighbour,
+            point: Vec2f,
+            max_dist: f32,
+            exclude_id: ?ClientId,
+        ) ![]Neighbour {
+            // TODO: implement
         }
 
         /// Draws a tree's grid subdivisions, cell labels, and stored volumes to an svg file.

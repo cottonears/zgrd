@@ -107,12 +107,26 @@ Neighbouring leaves' volumes are also frequently adjacent in memory, though it's
 ## Sizing your square tree
 (Tips + directions to how to size trees and use the benchmark tool on data representative of use-case, or (even better) directly imported data from a real scene).
 
+## 0.1 TODO
+- [ ] Improve benchmarking reports + tooling (repeatable before/after comparisons, less run-to-run noise).
+- [ ] Finish `findNearestNeighbours` (expanding-ring search + bounded best-K tracking), add a brute-force-agreement test,  research BIGMIN/LITMAX curve-range decomposition as a possible performance improvement;
+- [ ] Add `getLeafOccupancyUnderNode` + an indexer helper (e.g. `getLeafSuccessorRange`) to help with workload partitioning.
+- [ ] Implement a multi-threaded `findSelfOverlaps` (partition `top_occupied` across threads by occupancy, not raw node count; no locks).
+- [ ] Add the `layered_tree` wrapper (see Roadmap below).
+- [ ] Finish the placeholder sections of this README (Volumes, SquareTree, Indexing) — especially "Sizing your square tree", given how much query performance depends on `(base, top_levels, regular_levels, curve)`.
+- [ ] Implement `getExpandedVolume` (conservative bounding volumes for moving bodies); required to prevent tunnelling.
+- [ ] Set up CI (`zig build test` on push).
+
 ## Roadmap
 In no particular order:
 
 - Implement helper functions for creating conservative bounding volumes for moving bodies. Something along the lines of `getExpandedVolume(V, vol, velocity, time_step)`.
 - Add layered_tree that wraps several trees (e.g., static + dynamic, player1 + player2) and allows for ergonomic in-tree and cross-tree queries.
 - Add multi-threading support.
+  - Parallelise `updateBounds`'s per-level bounding-volume computation: per-node work on each level is independent, so only the shared `top_occupied` accumulation needs a lock-free strategy (e.g. per-thread sub-ranges of the buffer, or a bitmap + compaction pass).
+- Generalise `calc.getInterleaved`/`getDeinterleaved` to work with narrower integers instead of the current hardcoded u32 version. Also worth comparing against lookup-table and hardware `pdep`/`pext` (BMI2) approaches; see [libmorton](https://github.com/Forceflow/libmorton).
 - Experiment with a dynamic-depth 2D linear BVH along the lines of:
 https://gamma-web.iacs.umd.edu/papers/documents/articles/2009/lauterbach09.pdf
 https://www.pbr-book.org/4ed/Primitives_and_Intersection_Acceleration/Bounding_Volume_Hierarchies
+  - For construction, consider the parallel radix-tree approach from [Karras 2012](https://research.nvidia.com/sites/default/files/pubs/2012-06_Maximizing-Parallelism-in/karras2012hpg_paper.pdf) (sort primitives by curve index, build via longest-common-prefix, no sequential build step).
+  - Since this structure is derived from sort order rather than a fixed grid, non-Morton curves (Zigzag, Spring, etc.) might improve tree quality.
