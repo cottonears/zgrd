@@ -1,5 +1,6 @@
 const std = @import("std");
 const calc = @import("calc.zig");
+const data = @import("data.zig");
 const vol = @import("volume.zig");
 const math = std.math;
 const Vec2f = calc.Vec2f;
@@ -7,6 +8,7 @@ const Box2f = vol.Box2f;
 
 pub const Curve = enum {
     Morton, // the 'standard' Lebesgue / Morton curve produced by bit-interleaving
+    Spiral,
     Spring, // identical to Z for base = 2, but stretches for higher bases
     U, // looks like this: |_|
     Zigzag, // fancy
@@ -35,6 +37,13 @@ pub const Curve = enum {
         .{ 0xA, 0xB, 0xE, 0xF },
     };
 
+    const spiral4_index_map = [4][4]u4{
+        .{ 0x0, 0x1, 0x2, 0x3 },
+        .{ 0xB, 0xC, 0xD, 0x4 },
+        .{ 0xA, 0xF, 0xE, 0x5 },
+        .{ 0x9, 0x8, 0x7, 0x6 },
+    };
+
     const spring4_index_map = [4][4]u4{
         .{ 0x0, 0x1, 0x2, 0x3 },
         .{ 0x4, 0x5, 0x6, 0x7 },
@@ -55,6 +64,9 @@ pub const Curve = enum {
             .Morton => if (n == 2) morton2_index_map else morton4_index_map,
             .Spring => if (n == 2) morton2_index_map else spring4_index_map,
             .U => if (n == 2) u2_index_map else u4_index_map,
+            .Spiral => if (n == 4) spiral4_index_map else {
+                @compileError("spiral only supports base 4");
+            },
             .Zigzag => if (n == 4) zigzag4_index_map else {
                 @compileError("zigzag only supports base 4");
             },
@@ -111,7 +123,8 @@ pub fn Indexer2f(
         pub const num_leaves = nodes_in_level[depth - 1];
         const lvl_bitshift = math.log2(num_children);
         const axis_bitshift = math.log2(base);
-        const coord_max: Vec2f = @splat(calc.asf32(math.sqrt(num_leaves) - 1));
+        const coord_max: u16 = @intCast(math.sqrt(num_leaves) - 1);
+        const coord_max_vec2f: Vec2f = @splat(calc.asf32(coord_max));
         const level_scales = blk: {
             var scales: [depth]f32 = undefined;
             for (&scales, 0..) |*s, lvl| {
@@ -198,6 +211,53 @@ pub fn Indexer2f(
             return .{ .min = min, .max = min + @as(Vec2f, @splat(side_len)) };
         }
 
+        /// Gets the indexes of leaf cells that are n distance (taxi-cab metric) from a leaf node.
+        pub fn getLeafCellNeighbours(buff: []CurveIndex, index: CurveIndex, n: u16) ![]CurveIndex {
+            var blen: usize = 0;
+            if (n == 0) {
+                buff[0] = index;
+                return buff[0..1];
+            }
+            const grid_coords = getGridCoordsForIndex(index);
+            const top = grid_coords.row -| n;
+            const bot = @min(coord_max, grid_coords.row +| n);
+            const left = grid_coords.col -| n;
+            const right = @min(coord_max, grid_coords.col +| n);
+            // vertical scans
+            const add_left = grid_coords.col - left == n;
+            const add_right = right - grid_coords.col == n;
+            for (top..bot + 1) |i| {
+                if (add_left) {
+                    const l = GridCoords{ .row = @intCast(i), .col = left };
+                    buff[blen] = getIndexForGridCoords(effective_depth, l);
+                    blen += 1;
+                }
+                if (add_right) {
+                    const r = GridCoords{ .row = @intCast(i), .col = right };
+                    buff[blen] = getIndexForGridCoords(effective_depth, r);
+                    blen += 1;
+                }
+            }
+            // horizontal scans
+            const add_top = grid_coords.row - top == n;
+            const add_bot = bot - grid_coords.row == n;
+            for (left + 1..right) |j| {
+                if (add_top) {
+                    const t = GridCoords{ .row = top, .col = @intCast(j) };
+                    buff[blen] = getIndexForGridCoords(effective_depth, t);
+                    blen += 1;
+                }
+                if (add_bot) {
+                    const b = GridCoords{ .row = bot, .col = @intCast(j) };
+                    buff[blen] = getIndexForGridCoords(effective_depth, b);
+                    blen += 1;
+                }
+            }
+            const idx_buff = buff[0..blen];
+            std.sort.pdq(CurveIndex, idx_buff, {}, std.sort.asc(CurveIndex));
+            return idx_buff;
+        }
+
         /// Gets the min corner of the identified cell.
         fn gitMinForGridCoords(self: *const Self, gc: GridCoords) Vec2f {
             return .{
@@ -211,7 +271,7 @@ pub fn Indexer2f(
         fn getGridCoordsForPoint(self: *const Self, point: Vec2f) GridCoords {
             const offset = point - self.min_pt;
             const offset_scaled = calc.scaledVec(self.inv_cell_size, offset);
-            const offset_clamped = math.clamp(offset_scaled, calc.zero2f, coord_max);
+            const offset_clamped = math.clamp(offset_scaled, calc.zero2f, coord_max_vec2f);
             return .{ .row = @trunc(offset_clamped[1]), .col = @trunc(offset_clamped[0]) };
         }
 
@@ -382,7 +442,6 @@ test "leaf index round trip" {
     calc.ProbDensityFunc.fillVec2f(test_dist, prng.random(), &random_pts);
     const min_pt = Vec2f{ -5, -5 };
     const max_pt = Vec2f{ 5, 5 };
-
     // check that every leaf tiles part of the region, and its centre indexes back to it
     inline for (Indexers) |Indexer| {
         const indexer = try Indexer.init(min_pt, max_pt);
@@ -402,10 +461,38 @@ test "leaf index round trip" {
     }
 }
 
+test "check get leaf cell neighbours" {
+    var prng = std.Random.DefaultPrng.init(0);
+    var random_pts: [100]Vec2f = undefined;
+    calc.ProbDensityFunc.fillVec2f(test_dist, prng.random(), &random_pts);
+    const Indexer = Indexer2f(4, 1, 1, Curve.Zigzag);
+    const indexer = try Indexer.init(.{ -10, -10 }, .{ 10, 10 }); // NOTE: all random points are within central zone
+    // size and values match what is expected
+    for (random_pts) |p| {
+        const p_idx = indexer.getLeafIndexForPoint(p);
+        const p_gc = indexer.getGridCoordsForPoint(p);
+        var n_buff: [24]Indexer.CurveIndex = undefined;
+        const near_p_0 = try Indexer.getLeafCellNeighbours(&n_buff, p_idx, 0);
+        try testing.expectEqual(1, near_p_0.len);
+        try testing.expectEqual(p_idx, near_p_0[0]);
+        for (1..4) |n| {
+            const near_p_n = try Indexer.getLeafCellNeighbours(&n_buff, p_idx, @intCast(n));
+            try testing.expectEqual(8 * n, near_p_n.len);
+            for (near_p_n) |i| {
+                const i_gc = Indexer.getGridCoordsForIndex(i);
+                const row_diff = if (i_gc.row > p_gc.row) i_gc.row - p_gc.row else p_gc.row - i_gc.row;
+                const col_diff = if (i_gc.col > p_gc.col) i_gc.col - p_gc.col else p_gc.col - i_gc.col;
+                try testing.expectEqual(n, @max(row_diff, col_diff));
+            }
+        }
+    }
+}
+
 test "draw indexer curves" {
     const Indexers = .{
-        Indexer2f(2, 1, 5, Curve.Morton),
-        Indexer2f(2, 1, 5, Curve.U),
+        Indexer2f(2, 2, 4, Curve.Morton),
+        Indexer2f(2, 2, 4, Curve.U),
+        Indexer2f(4, 1, 2, Curve.Spiral),
         Indexer2f(4, 1, 2, Curve.Spring),
         Indexer2f(4, 1, 2, Curve.Zigzag),
     };

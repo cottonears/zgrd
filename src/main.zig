@@ -195,6 +195,7 @@ fn elapsedNs(t1: std.Io.Timestamp, t2: std.Io.Timestamp) f64 {
 }
 
 // TODO: format nicely and add average at bottom of table
+// ALSO: add other indicators of quality: e.g., min, q1, q2, q3, max index-jumps for neighbours
 fn benchmarkIndexing(allocator: std.mem.Allocator, io: std.Io) !void {
     const IndexerTypes = [_]type{
         index.Indexer2f(2, 1, 2, index.Curve.Morton),
@@ -362,7 +363,7 @@ fn benchMarkTree(
         try tree.addVolumes(bodies, entity_indexes);
         const t_1 = timer.now(io);
 
-        tree.updateBounds();
+        try tree.updateBounds();
         const t_2 = timer.now(io);
 
         overlaps += (try tree.findSelfOverlaps(overlap_buff)).len;

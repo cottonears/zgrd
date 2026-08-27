@@ -1,5 +1,6 @@
 const std = @import("std");
 const calc = @import("calc.zig");
+const data = @import("data.zig");
 const index = @import("index.zig");
 const svg = @import("svg.zig");
 const vol = @import("volume.zig");
@@ -28,8 +29,7 @@ pub fn SquareTree(
         leaf_counts: []DataIndex, // the number of volumes within each leaf node
         bfs_buff_a: []CurveIndex, // Scratch buffer for findOverlapsBfs
         bfs_buff_b: []CurveIndex, // Scratch buffer for findOverlapsBfs
-        top_occupied: []CurveIndex, // indexes of non-empty nodes on level 0
-        top_occupied_len: usize = 0, // number of entries in top_occupied
+        top_occupied: data.BoundedList(CurveIndex), // indexes of non-empty nodes on level 0
 
         pub const depth = Indexer.depth;
         pub const nodes_in_level = Indexer.nodes_in_level;
@@ -93,13 +93,13 @@ pub fn SquareTree(
                 .staged_ids = staged_ids,
                 .bfs_buff_a = bfs_buff_a,
                 .bfs_buff_b = bfs_buff_b,
-                .top_occupied = top_occupied,
+                .top_occupied = data.BoundedList(CurveIndex).init(top_occupied),
             };
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             for (self.node_bvs) |v| allocator.free(v);
-            allocator.free(self.top_occupied);
+            allocator.free(self.top_occupied.items);
             allocator.free(self.bfs_buff_b);
             allocator.free(self.bfs_buff_a);
             allocator.free(self.staged_ids);
@@ -136,10 +136,10 @@ pub fn SquareTree(
         /// Removes all volumes stored in leaf-nodes of the grid.
         pub fn clearStoredVolumes(self: *Self) void {
             @memset(self.leaf_counts, 0);
-            self.num_volumes = 0;
-            self.top_occupied_len = 0;
-            self.max_half_extent = calc.zero2f;
             self.bounds_valid = false;
+            self.max_half_extent = calc.zero2f;
+            self.num_volumes = 0;
+            self.top_occupied.clear();
         }
 
         /// Diagnostic: the largest number of volumes staged in any single leaf.
@@ -158,9 +158,8 @@ pub fn SquareTree(
 
         /// Grows all bounding volumes to cover all points within them.
         /// Sorts any volumes staged by `addVolume` into their final position.
-        pub fn updateBounds(self: *Self) void {
+        pub fn updateBounds(self: *Self) !void {
             self.sortStagedVolumes();
-            self.top_occupied_len = 0;
             // start with leaf nodes first
             for (self.node_bvs[depth - 1], 0..) |*bv, i| {
                 var box = vol.empty_box;
@@ -169,8 +168,7 @@ pub fn SquareTree(
                 }
                 bv.* = box;
                 if (depth == 1 and !box.isEmpty()) {
-                    self.top_occupied[self.top_occupied_len] = @intCast(i);
-                    self.top_occupied_len += 1;
+                    try self.top_occupied.add(@intCast(i));
                 }
             }
             // parent nodes, working up from the level above the leaves
@@ -185,8 +183,7 @@ pub fn SquareTree(
                     }
                     bv.* = box;
                     if (lvl == 0 and !box.isEmpty()) {
-                        self.top_occupied[self.top_occupied_len] = @intCast(j);
-                        self.top_occupied_len += 1;
+                        try self.top_occupied.add(@intCast(j));
                     }
                 }
             }
@@ -204,9 +201,9 @@ pub fn SquareTree(
         /// Requires `updateBounds` to have been called since the last `addVolume`.
         pub fn findSelfOverlaps(self: *const Self, res_buff: []OverlapPair) ![]OverlapPair {
             if (!self.bounds_valid) return error.BoundsNotUpdated;
-            var res_len: usize = 0;
             const top_bvs = self.node_bvs[0];
-            const occupied = self.top_occupied[0..self.top_occupied_len];
+            const occupied = self.top_occupied.getItems();
+            var res_list = data.BoundedList(OverlapPair).init(res_buff);
             if (compressed) { // check the nearby level 0 nodes only
                 for (occupied) |a| {
                     const bv_a = top_bvs[a];
@@ -217,20 +214,18 @@ pub fn SquareTree(
                     const near = self.indexer.getTopLevelIndexesForBox(self.bfs_buff_a, neighbourhood);
                     for (near) |b| {
                         if (b < a) continue; // the pair is visited from the lower node
-                        const rb = res_buff[res_len..];
-                        res_len += (try self.findSelfOverlapsDtt(0, rb, a, bv_a, b, top_bvs[b])).len;
+                        try self.findSelfOverlapsDtt(0, &res_list, a, bv_a, b, top_bvs[b]);
                     }
                 }
             } else { // check the occupied level 0 nodes from each one onwards
                 for (occupied, 0..) |a, i| {
                     const bv_a = top_bvs[a];
                     for (occupied[i..]) |b| {
-                        const rb = res_buff[res_len..];
-                        res_len += (try self.findSelfOverlapsDtt(0, rb, a, bv_a, b, top_bvs[b])).len;
+                        try self.findSelfOverlapsDtt(0, &res_list, a, bv_a, b, top_bvs[b]);
                     }
                 }
             }
-            return res_buff[0..res_len];
+            return res_list.getItems();
         }
 
         /// Draws a tree's grid subdivisions, cell labels, and stored volumes to an svg file.
@@ -403,68 +398,60 @@ pub fn SquareTree(
         fn findSelfOverlapsDtt(
             self: *const Self,
             comptime lvl: u4,
-            res_buff: []OverlapPair,
+            res_list: *data.BoundedList(OverlapPair),
             idx_a: CurveIndex,
             box_a: Box2f,
             idx_b: CurveIndex,
             box_b: Box2f,
-        ) ![]OverlapPair {
+        ) !void {
             std.debug.assert(idx_a <= idx_b);
-            if (!vol.checkVolumesOverlap(box_a, box_b)) return res_buff[0..0];
+            if (!vol.checkVolumesOverlap(box_a, box_b)) return;
             if (comptime lvl == depth - 1) {
-                return self.findLeafPairOverlaps(res_buff, idx_a, idx_b, box_b);
+                return self.findLeafPairOverlaps(res_list, idx_a, idx_b, box_b);
             }
-
             const same_node = idx_a == idx_b;
             var buff_a: [Indexer.num_children]CurveIndex = undefined;
             const live_a = self.findOverlappingChildren(lvl, &buff_a, idx_a, box_b);
-            if (live_a.len == 0) return res_buff[0..0];
+            if (live_a.len == 0) return;
             var buff_b: [Indexer.num_children]CurveIndex = undefined;
             const live_b = if (same_node) live_a else self.findOverlappingChildren(lvl, &buff_b, idx_b, box_a);
-
             const child_bvs = self.node_bvs[lvl + 1];
-            var res_len: usize = 0;
             for (live_a, 0..) |child_a, i| {
                 const box_ca = child_bvs[child_a];
                 const first_b = if (same_node) i else 0;
                 for (live_b[first_b..]) |child_b| {
-                    res_len += (try self.findSelfOverlapsDtt(
+                    try self.findSelfOverlapsDtt(
                         lvl + 1,
-                        res_buff[res_len..],
+                        res_list,
                         child_a,
                         box_ca,
                         child_b,
                         child_bvs[child_b],
-                    )).len;
+                    );
                 }
             }
-            return res_buff[0..res_len];
         }
 
         fn findLeafPairOverlaps(
             self: *const Self,
-            res_buff: []OverlapPair,
+            res_list: *data.BoundedList(OverlapPair),
             idx_a: CurveIndex,
             idx_b: CurveIndex,
             box_b: Box2f,
-        ) ![]OverlapPair {
+        ) !void {
             const vols_a = self.getLeafVolumes(idx_a);
             const ids_a = self.getLeafIds(idx_a);
             const vols_b = self.getLeafVolumes(idx_b);
             const ids_b = self.getLeafIds(idx_b);
             const same_leaf = idx_a == idx_b;
-            var res_len: usize = 0;
             for (vols_a, ids_a, 0..) |vol_a, id_a, i| {
                 if (!same_leaf and !vol.checkVolumesOverlap(vol_a.getBoundingBox(), box_b)) continue;
                 const first_b = if (same_leaf) i + 1 else 0;
                 for (vols_b[first_b..], ids_b[first_b..]) |vol_b, id_b| {
                     if (!vol.checkVolumesOverlap(vol_a, vol_b)) continue;
-                    if (res_buff.len == res_len) return error.OverlapBufferCapacityExceeded;
-                    res_buff[res_len] = .{ id_a, id_b };
-                    res_len += 1;
+                    res_list.add(.{ id_a, id_b }) catch return error.OverlapBufferCapacityExceeded;
                 }
             }
-            return res_buff[0..res_len];
         }
 
         fn findOverlappingChildren(
@@ -517,7 +504,7 @@ test "hex tree overlap ball" {
     };
     const indexes = calc.getRange(u32, balls.len);
     try tree.addVolumes(balls[0..], &indexes);
-    tree.updateBounds();
+    try tree.updateBounds();
 
     const leaf_a = tree.indexer.getLeafIndexForPoint(balls[0].getCentre());
     const leaf_b = tree.indexer.getLeafIndexForPoint(balls[1].getCentre());
@@ -559,7 +546,7 @@ test "hex tree overlap box" {
     const indexes = calc.getRange(u32, boxes.len);
     try tree.addVolumes(&boxes, &indexes);
 
-    tree.updateBounds();
+    try tree.updateBounds();
 
     const leaf_0 = tree.indexer.getLeafIndexForPoint(boxes[0].getCentre());
     const leaf_1 = tree.indexer.getLeafIndexForPoint(boxes[1].getCentre());
@@ -601,7 +588,7 @@ test "square tree add remove" {
     const indexes = calc.getRange(u32, test_bodies.len);
     try qt.addVolumes(&test_bodies, &indexes);
     try testing.expectEqual(3, qt.num_volumes);
-    qt.updateBounds();
+    try qt.updateBounds();
 
     for (0..QuadTree.num_leaves) |leaf_num_usize| {
         const leaf_num: QuadTree.CurveIndex = @intCast(leaf_num_usize);
@@ -630,7 +617,7 @@ test "staged volumes keep their insertion rank within a leaf" {
         const indexes = [_]u32{@intCast(i)};
         try qt.addVolumes(&balls, &indexes);
     }
-    qt.updateBounds();
+    try qt.updateBounds();
 
     // ranks are assigned per leaf, so both leaves should see their volumes in insertion order
     const leaf_even = qt.indexer.getLeafIndexForPoint(Vec2f{ 0.1, 0.1 });
@@ -674,7 +661,7 @@ test "findSelfOverlaps agrees with brute force" {
         defer tree.deinit(test_alloc);
         const indexes = calc.getRange(u32, num_vols);
         try tree.addVolumes(bodies, &indexes);
-        tree.updateBounds();
+        try tree.updateBounds();
         // brute force reference
         var expected: std.ArrayList(Tree.OverlapPair) = .empty;
         defer expected.deinit(test_alloc);
@@ -721,7 +708,7 @@ test "findOverlaps agrees with brute force" {
         defer tree.deinit(test_alloc);
         const indexes = calc.getRange(u32, num_vols);
         try tree.addVolumes(bodies, &indexes);
-        tree.updateBounds();
+        try tree.updateBounds();
 
         const id_buff = try test_alloc.alloc(Tree.ClientIdType, num_vols);
         defer test_alloc.free(id_buff);
@@ -767,7 +754,7 @@ test "draw square trees svg" {
         const bodies = test_vols.getRandomBodies(Tree.VolumeType);
         const indexes = calc.getRange(u32, num_vols);
         try tree.addVolumes(bodies, &indexes);
-        tree.updateBounds();
+        try tree.updateBounds();
 
         var canvas = try tree.drawTreeSvg(test_alloc, true);
         defer canvas.deinit(test_alloc);
