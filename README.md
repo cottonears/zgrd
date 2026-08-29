@@ -108,7 +108,7 @@ Neighbouring leaves' volumes are also frequently adjacent in memory, though it's
 (Tips + directions to how to size trees and use the benchmark tool on data representative of use-case, or (even better) directly imported data from a real scene).
 
 ## 0.1 TODO
-- [ ] Improve benchmarking reports + tooling (repeatable before/after comparisons, less run-to-run noise).
+- [X] Improve benchmarking reports + tooling (repeatable before/after comparisons, less run-to-run noise).
 - [ ] Finish `findNearestNeighbours` (expanding-ring search + bounded best-K tracking), add a brute-force-agreement test,  research BIGMIN/LITMAX curve-range decomposition as a possible performance improvement;
 - [ ] Add `getLeafOccupancyUnderNode` + an indexer helper (e.g. `getLeafSuccessorRange`) to help with workload partitioning.
 - [ ] Implement a multi-threaded `findSelfOverlaps` (partition `top_occupied` across threads by occupancy, not raw node count; no locks).

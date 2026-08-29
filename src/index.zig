@@ -121,6 +121,10 @@ pub fn Indexer2f(
         pub const nodes_in_level = calc.getPow2nSequence(base, top_levels, effective_depth);
         pub const num_children = base * base;
         pub const num_leaves = nodes_in_level[depth - 1];
+        pub const type_label = std.fmt.comptimePrint(
+            "{s} {d} x {d} [{d}]",
+            .{ @tagName(curve), base, effective_depth, depth },
+        );
         const lvl_bitshift = math.log2(num_children);
         const axis_bitshift = math.log2(base);
         const coord_max: u16 = @intCast(math.sqrt(num_leaves) - 1);

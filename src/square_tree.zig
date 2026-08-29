@@ -229,18 +229,18 @@ pub fn SquareTree(
             return res_list.getItems();
         }
 
-        /// Finds up to `res_buff.len` stored volumes nearest to a point, nearest-first.
-        /// Search stops when buffer is full or there are no more candidates within `max_dist`.
-        /// Requires `updateBounds` to have been called since the last `addVolume`.
-        pub fn findNearestNeighbours(
-            self: *const Self,
-            res_buff: []Neighbour,
-            point: Vec2f,
-            max_dist: f32,
-            exclude_id: ?ClientId,
-        ) ![]Neighbour {
-            // TODO: implement
-        }
+        // /// Finds up to `res_buff.len` stored volumes nearest to a point, nearest-first.
+        // /// Search stops when buffer is full or there are no more candidates within `max_dist`.
+        // /// Requires `updateBounds` to have been called since the last `addVolume`.
+        // pub fn findNearestNeighbours(
+        //     self: *const Self,
+        //     res_buff: []Neighbour,
+        //     point: Vec2f,
+        //     max_dist: f32,
+        //     exclude_id: ?ClientId,
+        // ) ![]Neighbour {
+        //     // TODO: implement
+        // }
 
         /// Draws a tree's grid subdivisions, cell labels, and stored volumes to an svg file.
         /// Accepts a pointer to any tree exposing the same public interface as `SquareTree`.

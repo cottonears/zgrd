@@ -80,6 +80,12 @@ pub fn DataTable(
             self.num_rows += 1;
         }
 
+        /// Clears columns' contents.
+        pub fn clear(self: *Self) void {
+            for (0..num_cols) |j| self.column_data[j].clear();
+            self.num_rows = 0;
+        }
+
         /// Sorts column data and gets range + IQR stats for each: { min, q1, q2, q3, max }.
         /// Doesn't interpolate between indexes: inacurate for a low sample sizes.
         pub fn computeStats(self: *Self) ?[num_cols][5]T {
@@ -101,7 +107,7 @@ pub fn DataTable(
         /// Builds a multi-line string representing a table's stats.
         /// Caller owns the returned slice.
         pub fn getStatsTable(self: *Self, allocator: std.mem.Allocator) ![]u8 {
-            var string_list = try std.ArrayList(u8).initCapacity(allocator, num_cols * 64);
+            var string_list = try std.ArrayList(u8).initCapacity(allocator, @as(usize, num_cols) * 64);
             errdefer string_list.deinit(allocator);
             const col_stats = self.computeStats() orelse return error.NoValues;
             try string_list.appendSlice(allocator, "|     |");
