@@ -88,11 +88,11 @@ pub const Curve = enum {
 
 /// Recursively indexes a region on the 2D plane.
 /// Level 0 'compresses' several layers' worth of children to limit traversal depth.
-/// Nodes on subsequent levels each have num_children.
+/// Nodes on subsequent levels each have sub_divs x sub_divs children.
 pub fn Indexer2f(
-    comptime subdivisions_per_axis: u8, // cells per axis, per level; choose 2 or 4
-    comptime compressed_top_levels: u4, // levels folded into level 0; 1 = uncompressed
-    comptime regular_levels: u4, // subdividing levels below level 0
+    comptime subdivs_per_axis: u8, // cells per axis, per level; choose 2 or 4
+    comptime top_lvl_compression: u4, // levels folded into level 0; 1 = uncompressed
+    comptime regular_levels: u4, // uncompressed levels below level 0
     comptime curve_type: Curve, // type of space-filling curve used
 ) type {
     return struct {
@@ -102,21 +102,21 @@ pub fn Indexer2f(
         max_pt: Vec2f,
 
         comptime { // check arguments are supported when compiling
-            if (!(subdivisions_per_axis == 2 or subdivisions_per_axis == 4)) {
+            if (!(subdivs_per_axis == 2 or subdivs_per_axis == 4)) {
                 @compileError("subdivisions_per_axis must be 2 or 4");
             }
-            if (compressed_top_levels == 0) {
+            if (top_lvl_compression == 0) {
                 @compileError("compressed_top_levels must be greater than 0");
             }
         }
 
         pub const CurveIndex = math.IntFittingRange(0, num_leaves - 1);
         pub const LevelIndex = math.IntFittingRange(0, depth - 1); // 0 = top level (coarsest grid)
-        pub const base = subdivisions_per_axis;
+        pub const base = subdivs_per_axis;
         pub const curve = curve_type;
-        pub const top_levels = compressed_top_levels;
+        pub const top_levels = top_lvl_compression;
         pub const depth = 1 + regular_levels;
-        pub const effective_depth = compressed_top_levels + regular_levels;
+        pub const effective_depth = top_lvl_compression + regular_levels;
         // level 0 spans top_levels subdivisions; every level below it spans one
         pub const nodes_in_level = calc.getPow2nSequence(base, top_levels, effective_depth);
         pub const num_children = base * base;
@@ -224,9 +224,9 @@ pub fn Indexer2f(
             }
             const grid_coords = getGridCoordsForIndex(index);
             const top = grid_coords.row -| n;
-            const bot = @min(coord_max, grid_coords.row +| n);
+            const bot: GridIndex = @min(coord_max, grid_coords.row +| n);
             const left = grid_coords.col -| n;
-            const right = @min(coord_max, grid_coords.col +| n);
+            const right: GridIndex = @min(coord_max, grid_coords.col +| n);
             // vertical scans
             const add_left = grid_coords.col - left == n;
             const add_right = right - grid_coords.col == n;
@@ -245,7 +245,9 @@ pub fn Indexer2f(
             // horizontal scans
             const add_top = grid_coords.row - top == n;
             const add_bot = bot - grid_coords.row == n;
-            for (left + 1..right) |j| {
+            const h_start = if (add_left) left + 1 else left;
+            const h_end = if (add_right) right else right + 1;
+            for (h_start..h_end) |j| {
                 if (add_top) {
                     const t = GridCoords{ .row = top, .col = @intCast(j) };
                     buff[blen] = getIndexForGridCoords(effective_depth, t);
@@ -465,12 +467,12 @@ test "leaf index round trip" {
     }
 }
 
-test "check get leaf cell neighbours" {
+test "check get leaf cell neighbours in centre" {
     var prng = std.Random.DefaultPrng.init(0);
     var random_pts: [100]Vec2f = undefined;
     calc.ProbDensityFunc.fillVec2f(test_dist, prng.random(), &random_pts);
     const Indexer = Indexer2f(4, 1, 1, Curve.Zigzag);
-    const indexer = try Indexer.init(.{ -10, -10 }, .{ 10, 10 }); // NOTE: all random points are within central zone
+    const indexer = try Indexer.init(.{ -10, -10 }, .{ 10, 10 });
     // size and values match what is expected
     for (random_pts) |p| {
         const p_idx = indexer.getLeafIndexForPoint(p);
@@ -490,6 +492,28 @@ test "check get leaf cell neighbours" {
             }
         }
     }
+}
+
+test "check get leaf cell neighbours near edge" {
+    const Indexer = Indexer2f(4, 1, 2, Curve.Zigzag);
+    const p_idx: Indexer.CurveIndex = 0;
+    const p_gc = Indexer.getGridCoordsForIndex(p_idx);
+    var idx_seen = [_]bool{false} ** Indexer.num_leaves;
+    var n_buff: [Indexer.num_leaves]Indexer.CurveIndex = undefined;
+    var n: u16 = 0;
+    while (n <= Indexer.coord_max) : (n += 1) {
+        const ring = try Indexer.getLeafCellNeighbours(&n_buff, p_idx, n);
+        for (ring) |i| {
+            const i_gc = Indexer.getGridCoordsForIndex(i);
+            const row_diff = if (i_gc.row > p_gc.row) i_gc.row - p_gc.row else p_gc.row - i_gc.row;
+            const col_diff = if (i_gc.col > p_gc.col) i_gc.col - p_gc.col else p_gc.col - i_gc.col;
+            try testing.expectEqual(n, @max(row_diff, col_diff));
+            try testing.expectEqual(false, idx_seen[i]); // never return same index twice
+            idx_seen[i] = true;
+        }
+    }
+    // searched across the whole grid: every leaf should be found
+    for (idx_seen) |s| try testing.expectEqual(true, s);
 }
 
 test "draw indexer curves" {

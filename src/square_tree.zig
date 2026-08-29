@@ -229,18 +229,48 @@ pub fn SquareTree(
             return res_list.getItems();
         }
 
-        // /// Finds up to `res_buff.len` stored volumes nearest to a point, nearest-first.
-        // /// Search stops when buffer is full or there are no more candidates within `max_dist`.
-        // /// Requires `updateBounds` to have been called since the last `addVolume`.
-        // pub fn findNearestNeighbours(
-        //     self: *const Self,
-        //     res_buff: []Neighbour,
-        //     point: Vec2f,
-        //     max_dist: f32,
-        //     exclude_id: ?ClientId,
-        // ) ![]Neighbour {
-        //     // TODO: implement
-        // }
+        /// Finds stored volumes nearest to the query point, nearest-first.
+        /// Search stops when k volumes are found, or there are no more candidates within `max_dist`.
+        /// Requires `updateBounds` to have been called since the last `addVolume`.
+        pub fn findNearestNeighbours(
+            self: *const Self,
+            buf: []Neighbour,
+            point: Vec2f,
+            k: u16,
+            max_dist: f32,
+            exclude_id: ?ClientId,
+        ) ![]Neighbour {
+            if (k > buf.len) return error.UndersizedBuffer;
+            const leaf_index = self.indexer.getLeafIndexForPoint(point);
+            var len: usize = 0;
+            var iter: u16 = 0;
+            var furthest_dist: f32 = 0;
+            var next_min_dist: f32 = 0;
+            while (next_min_dist < max_dist and (len < k or next_min_dist < furthest_dist)) {
+                const leaves = try Indexer.getLeafCellNeighbours(self.bfs_buff_a, leaf_index, iter);
+                for (leaves) |i| {
+                    const vols = self.getLeafVolumes(i);
+                    for (vols, self.getLeafIds(i)) |v, client_id| {
+                        if (exclude_id != null and exclude_id.? == client_id) continue;
+                        const dist_squared = calc.squaredSum(v.getCentre() - point);
+                        const threshold = if (len < k) max_dist else furthest_dist;
+                        if (dist_squared >= threshold * threshold) continue;
+                        const dist = @sqrt(dist_squared);
+                        const n_info = Neighbour{ .id = client_id, .dist = dist };
+                        var pos = if (len < k) len else k - 1;
+                        while (pos > 0 and buf[pos - 1].dist > dist) : (pos -= 1) {
+                            buf[pos] = buf[pos - 1];
+                        }
+                        buf[pos] = n_info;
+                        if (len < k) len += 1;
+                        furthest_dist = buf[len - 1].dist;
+                    }
+                }
+                next_min_dist = calc.asf32(iter) * self.indexer.cell_size;
+                iter += 1;
+            }
+            return buf[0..len];
+        }
 
         /// Draws a tree's grid subdivisions, cell labels, and stored volumes to an svg file.
         /// Accepts a pointer to any tree exposing the same public interface as `SquareTree`.
@@ -407,7 +437,7 @@ pub fn SquareTree(
         }
 
         // TODO: provide public version of dual tree traversal for separate tree-vs-tree checks:
-        // reference algorithm https://arxiv.org/pdf/2012.05348
+        // reference algorithm: https://arxiv.org/pdf/2012.05348
 
         fn findSelfOverlapsDtt(
             self: *const Self,
@@ -738,6 +768,8 @@ test "findOverlaps agrees with brute force" {
         }
         try testing.expect(total > num_vols);
     }
+
+    // TODO: add brute-force test for find-nearest neighbours
 }
 
 test "draw square trees svg" {

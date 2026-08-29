@@ -1,12 +1,12 @@
-# zgrd
+# Zgrid
 
-Zgrd (pronounced 'zigrid') is a library for 2D spatial data structures that aims to do be three things:
+Zgrid is a library for 2D spatial data structures that aims to do be three things:
 - Simple
 - Lightweight
 - Efficient
 
-Currently zgrd offers just one data structure, `SquareTree`, for fast queries in 2D scenes.
-It is tailored to realtime applications where thousands of bodies are fairly uniformly distributed (e.g., RTS- and MMORPG-style games, life / particle simulators).
+Currently zgrid only offers one data structure, `SquareTree`, for fast queries in 2D scenes.
+It is tailored to realtime applications where thousands of bodies are fairly uniformly distributed (e.g., life / particle simulators, RPG-/RTS-style games).
 It aims to extend the commonly-used (for good reason!) uniform grid approach in a useful way.
 A square tree won't be suitable for every application, it is likely to be much slower than alternatives for very sparse scenes.
 More data structures are planned in future, see the [Roadmap](#roadmap).
@@ -16,27 +16,27 @@ Zig 0.16.
 
 ## Installation
 
-Use `zig fetch` to import the zgrd package to your project:
+Use `zig fetch` to import the zgrid package to your project:
 ``` sh
-zig fetch --save git+https://github.com/cottonears/zgrd
+zig fetch --save git+https://github.com/cottonears/zgrid
 ```
 Then register it as a dependency of your app in `build.zig.zon`:
 ``` zig
-const zgrd_dep = b.dependency("zgrd", .{
+const zgrid_dep = b.dependency("zgrid", .{
     .target = target,
     .optimize = optimize,
 });
-exe.root_module.addImport("zgrd", zgrd_dep.module("zgrd"));
+exe.root_module.addImport("zgrid", zgrid_dep.module("zgrid"));
 ```
 
 ## Simple working example
 ``` zig
 const std = @import("std");
-const zgrd = @import("zgrd");
-const Ball2f = zgrd.volume.Ball2f;
-const Box2f = zgrd.volume.Box2f;
-const Indexer = zgrd.index.Indexer2f(4, 2, 1, .Zigzag);
-const SquareTree = zgrd.square_tree.SquareTree(Indexer, Box2f, u16);
+const zgrid = @import("zgrid");
+const Ball2f = zgrid.volume.Ball2f;
+const Box2f = zgrid.volume.Box2f;
+const Indexer = zgrid.index.Indexer2f(4, 2, 1, .Zigzag);
+const SquareTree = zgrid.square_tree.SquareTree(Indexer, Box2f, u16);
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-There is a companion project [`zgrd-demo`](https://github.com/cottonears/zgrd-demo) that shows a more complete example of using zgrd within a game / simulation loop.
+There is a companion project [`zgrid-demo`](https://github.com/cottonears/zgrid-demo) that uses zgrid + SDL3 for simple particle simulation.
 
 
 ## Volumes
@@ -109,24 +109,22 @@ Neighbouring leaves' volumes are also frequently adjacent in memory, though it's
 
 ## 0.1 TODO
 - [X] Improve benchmarking reports + tooling (repeatable before/after comparisons, less run-to-run noise).
-- [ ] Finish `findNearestNeighbours` (expanding-ring search + bounded best-K tracking), add a brute-force-agreement test,  research BIGMIN/LITMAX curve-range decomposition as a possible performance improvement;
+- [X] Finish `findNearestNeighbours` (expanding-ring search + bounded best-K tracking), add a brute-force-agreement test,  research BIGMIN/LITMAX curve-range decomposition as a possible performance improvement;
 - [ ] Add `getLeafOccupancyUnderNode` + an indexer helper (e.g. `getLeafSuccessorRange`) to help with workload partitioning.
 - [ ] Implement a multi-threaded `findSelfOverlaps` (partition `top_occupied` across threads by occupancy, not raw node count; no locks).
-- [ ] Add the `layered_tree` wrapper (see Roadmap below).
-- [ ] Finish the placeholder sections of this README (Volumes, SquareTree, Indexing) — especially "Sizing your square tree", given how much query performance depends on `(base, top_levels, regular_levels, curve)`.
-- [ ] Implement `getExpandedVolume` (conservative bounding volumes for moving bodies); required to prevent tunnelling.
+- [ ] Finish the placeholder sections of this README (Volumes, SquareTree, Indexing, "Sizing your square tree").
+- [ ] Implement `getExpandedVolume(V, vol, velocity, time_step)` (makes conservative BVs for moving bodies); required to prevent tunnelling.
 - [ ] Set up CI (`zig build test` on push).
 
 ## Roadmap
 In no particular order:
 
-- Implement helper functions for creating conservative bounding volumes for moving bodies. Something along the lines of `getExpandedVolume(V, vol, velocity, time_step)`.
 - Add layered_tree that wraps several trees (e.g., static + dynamic, player1 + player2) and allows for ergonomic in-tree and cross-tree queries.
 - Add multi-threading support.
-  - Parallelise `updateBounds`'s per-level bounding-volume computation: per-node work on each level is independent, so only the shared `top_occupied` accumulation needs a lock-free strategy (e.g. per-thread sub-ranges of the buffer, or a bitmap + compaction pass).
+- Parallelise `updateBounds`'s per-level bounding-volume computation: per-node work on each level is independent, so only the shared `top_occupied` accumulation needs a lock-free strategy (e.g. per-thread sub-ranges of the buffer, or a bitmap + compaction pass).
 - Generalise `calc.getInterleaved`/`getDeinterleaved` to work with narrower integers instead of the current hardcoded u32 version. Also worth comparing against lookup-table and hardware `pdep`/`pext` (BMI2) approaches; see [libmorton](https://github.com/Forceflow/libmorton).
 - Experiment with a dynamic-depth 2D linear BVH along the lines of:
 https://gamma-web.iacs.umd.edu/papers/documents/articles/2009/lauterbach09.pdf
 https://www.pbr-book.org/4ed/Primitives_and_Intersection_Acceleration/Bounding_Volume_Hierarchies
   - For construction, consider the parallel radix-tree approach from [Karras 2012](https://research.nvidia.com/sites/default/files/pubs/2012-06_Maximizing-Parallelism-in/karras2012hpg_paper.pdf) (sort primitives by curve index, build via longest-common-prefix, no sequential build step).
-  - Since this structure is derived from sort order rather than a fixed grid, non-Morton curves (Zigzag, Spring, etc.) might improve tree quality.
+  - Since this structure is derived from sort order rather than a fixed grid, non-Morton curves (Zigzag, Hilbert, etc.) might improve tree quality.
