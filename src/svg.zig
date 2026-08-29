@@ -115,7 +115,7 @@ pub const Canvas = struct {
     }
 
     // caller owns the returned memory
-    pub fn getSvg(self: Self, allocator: mem.Allocator) ![]u8 {
+    pub fn getSvg(self: *const Self, allocator: mem.Allocator) ![]u8 {
         const extent = self.max - self.min;
         const rendered_max_dim: f32 = 800.0;
         const safe_w = if (extent[0] != 0) extent[0] else 1.0;
@@ -174,7 +174,7 @@ pub const ShapeStyle = struct {
     stroke_opacity: f32 = 1.0,
     stroke_dashed: bool = false,
 
-    pub fn getElementString(style: ShapeStyle, buff_ptr: []u8) ![]u8 {
+    pub fn getElementString(style: *const ShapeStyle, buff_ptr: []u8) ![]u8 {
         var len: usize = 0;
         if (style.fill_active) {
             len = (try std.fmt.bufPrint(

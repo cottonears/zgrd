@@ -1,5 +1,6 @@
 const std = @import("std");
 pub const calc = @import("calc.zig");
+pub const data = @import("data.zig");
 pub const index = @import("index.zig");
 pub const square_tree = @import("square_tree.zig");
 pub const volume = @import("volume.zig");
