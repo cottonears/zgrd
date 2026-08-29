@@ -99,30 +99,31 @@ pub fn DataTable(
         }
 
         /// Builds a multi-line string representing a table's stats.
-        pub fn getStatsTable(self: *Self, allocator: std.mem.Allocator) !std.ArrayList(u8) {
-            var string = try std.ArrayList(u8).initCapacity(allocator, num_cols * 64);
-            errdefer string.deinit(allocator);
-            const col_stats = self.computeStats() orelse return string;
-            try string.appendSlice(allocator, "|     |");
+        /// Caller owns the returned slice.
+        pub fn getStatsTable(self: *Self, allocator: std.mem.Allocator) ![]u8 {
+            var string_list = try std.ArrayList(u8).initCapacity(allocator, num_cols * 64);
+            errdefer string_list.deinit(allocator);
+            const col_stats = self.computeStats() orelse return error.NoValues;
+            try string_list.appendSlice(allocator, "|     |");
             for (0..num_cols) |j| {
-                try string.appendSlice(allocator, headers[j]);
-                try string.append(allocator, '|');
+                try string_list.appendSlice(allocator, headers[j]);
+                try string_list.append(allocator, '|');
             }
             const row_titles: [5][]const u8 = .{ " min ", " q1  ", " q2  ", " q3  ", " max " };
             var stat_buff: [32]u8 = undefined;
             for (0..5) |i| {
-                try string.appendSlice(allocator, "\n|");
-                try string.appendSlice(allocator, row_titles[i]);
-                try string.append(allocator, '|');
+                try string_list.appendSlice(allocator, "\n|");
+                try string_list.appendSlice(allocator, row_titles[i]);
+                try string_list.append(allocator, '|');
                 inline for (0..num_cols) |j| {
                     const cell_val = col_stats[j][i];
                     const stat_str = try std.fmt.bufPrint(&stat_buff, formats[j], .{cell_val});
-                    try string.appendSlice(allocator, stat_str);
-                    try string.append(allocator, '|');
+                    try string_list.appendSlice(allocator, stat_str);
+                    try string_list.append(allocator, '|');
                 }
             }
-            try string.append(allocator, '\n');
-            return string;
+            try string_list.append(allocator, '\n');
+            return string_list.toOwnedSlice(allocator);
         }
     };
 }
@@ -141,7 +142,7 @@ test "add to data table" {
         const p = 8.314 * 42.29 * t / 1000.0;
         try my_table.addRow(.{ n, p, t });
     }
-    var table_str = try my_table.getStatsTable(test_alloc);
-    defer table_str.deinit(test_alloc);
-    std.debug.print("{s}", .{table_str.items});
+    const table_str = try my_table.getStatsTable(test_alloc);
+    defer test_alloc.free(table_str);
+    // std.debug.print("{s}", .{table_str});
 }
