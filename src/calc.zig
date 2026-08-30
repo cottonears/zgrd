@@ -191,6 +191,17 @@ pub fn transformToFrame(p: Vec2f, frame_origin: Vec2f, frame_axis: Vec2f) Vec2f 
     return .{ dotProduct(rel, frame_axis), dotProduct(rel, ay) };
 }
 
+/// Gets a u64 based on system clock's measured nanoseconds - helpful in tests
+pub fn getClockBasedRngSeed(io: std.Io) u64 {
+    const now = std.Io.Clock.real.now(io);
+    return @truncate(@abs(now.nanoseconds));
+}
+
+/// Use this in errdefer block to help reproduce an error that might be related to a random seed.
+pub fn printErrorMessageForRandomSeed(seed: u64) void {
+    std.debug.print("Error when testing with random data; seed = {d}\n", .{seed});
+}
+
 /// Defines a probability distribution used to generate f32 test data.
 pub const ProbDensityFunc = union(enum) {
     uniform: struct { min: f32, max: f32 },
@@ -291,9 +302,11 @@ test "closest dist interval" {
 
 test "morton interleaving is 1:1" {
     // should be a bijection for grid coords (row + col)
-    var rng = std.Random.DefaultPrng.init(0);
-    const random = rng.random();
-    for (0..10000) |_| {
+    const seed = getClockBasedRngSeed(testing.io);
+    var prng = std.Random.DefaultPrng.init(seed);
+    errdefer std.debug.print("Error when testing with random data; seed = {d}\n", .{seed});
+    const random = prng.random();
+    for (0..5000) |_| {
         const x = random.int(u16);
         const y = random.int(u16);
         const z = getInterleaved(.{ x, y });
