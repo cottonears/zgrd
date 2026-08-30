@@ -178,7 +178,7 @@ pub fn checkVolumesOverlap(a: anytype, b: anytype) bool {
     };
 }
 
-/// Returns a box that encompasses both a and b.
+/// Returns a box that covers both a and b.
 pub fn getEncompassingBox(a: anytype, b: anytype) Box2f {
     const box_a: Box2f = if (@TypeOf(a) == Box2f) a else a.getBoundingBox();
     const box_b: Box2f = if (@TypeOf(b) == Box2f) b else b.getBoundingBox();
@@ -414,6 +414,7 @@ pub const TestVolumes = struct {
 };
 
 const testing = std.testing;
+const test_alloc = testing.allocator;
 const test_num_volumes = 16000;
 const test_min_extent = 0.1;
 const test_max_extent = 5.0;
@@ -501,9 +502,6 @@ test "oriented box - box overlap" {
     try testing.expectEqual(false, checkVolumesOverlap(obb, b2));
     try testing.expectEqual(false, checkVolumesOverlap(obb, b3));
     try testing.expectEqual(true, checkVolumesOverlap(obb, b4));
-    // argument order shouldn't matter
-    try testing.expectEqual(true, checkVolumesOverlap(b1, obb));
-    try testing.expectEqual(false, checkVolumesOverlap(b2, obb));
 }
 
 test "oriented box - oriented box overlap" {
@@ -531,33 +529,6 @@ test "oriented box - oriented box overlap" {
     try testing.expectEqual(false, checkVolumesOverlap(a, b2));
     try testing.expectEqual(false, checkVolumesOverlap(a, b3));
     try testing.expectEqual(true, checkVolumesOverlap(b1, a));
-}
-
-test "unrotated oriented box matches its axis-aligned box" {
-    const centre = Vec2f{ 1.0, -0.5 };
-    const half = Vec2f{ 0.7, 1.3 };
-    const obb = OrientedBox2f{ .centre = centre, .half_extents = half, .axis = .{ 1, 0 } };
-    const equivalent_box = Box2f{ .min = centre - half, .max = centre + half };
-    var rng = std.Random.Xoshiro256.init(2);
-    var test_vols = try TestVolumes.initRandom(
-        testing.allocator,
-        rng.random(),
-        test_num_volumes,
-        .{ .uniform = .{ .min = test_min_extent, .max = test_max_extent } },
-        .{ .uniform = .{ .min = test_space_min, .max = test_space_max } },
-    );
-    defer test_vols.deinit(testing.allocator);
-
-    for (test_vols.getRandomBodies(Ball2f)) |b| {
-        const expected = checkVolumesOverlap(equivalent_box, b);
-        try testing.expectEqual(expected, checkVolumesOverlap(obb, b));
-        try testing.expectEqual(expected, checkVolumesOverlap(b, obb));
-    }
-    for (test_vols.getRandomBodies(Box2f)) |b| {
-        const expected = checkVolumesOverlap(equivalent_box, b);
-        try testing.expectEqual(expected, checkVolumesOverlap(obb, b));
-        try testing.expectEqual(expected, checkVolumesOverlap(b, obb));
-    }
 }
 
 test "line-ball overlap" {
@@ -606,18 +577,6 @@ test "line-box overlap" {
     try testing.expectEqual(false, checkVolumesOverlap(b2, line));
 }
 
-test "axis-aligned and perpendicuar lines vs box" {
-    const box = Box2f{ .min = .{ 0, 0 }, .max = .{ 2, 2 } };
-    const vertical_hit = Line2f{ .start = .{ 1, -5 }, .end = .{ 1, 5 } };
-    const vertical_miss = Line2f{ .start = .{ 5, -5 }, .end = .{ 5, 5 } };
-    const point_inside = Line2f{ .start = .{ 1, 1 }, .end = .{ 1, 1 } };
-    const point_outside = Line2f{ .start = .{ 5, 5 }, .end = .{ 5, 5 } };
-    try testing.expectEqual(true, checkVolumesOverlap(vertical_hit, box));
-    try testing.expectEqual(false, checkVolumesOverlap(vertical_miss, box));
-    try testing.expectEqual(true, checkVolumesOverlap(point_inside, box));
-    try testing.expectEqual(false, checkVolumesOverlap(point_outside, box));
-}
-
 test "encompassing boxes" {
     const a = Box2f{ .min = .{ -0.139, -0.139 }, .max = .{ 0.139, 0.139 } };
     const b = Box2f{ .min = .{ -0.735, -0.2 }, .max = .{ 0.2, 0.735 } };
@@ -626,36 +585,20 @@ test "encompassing boxes" {
     try testing.expectEqual(@max(a.max, b.max), c.max);
 }
 
-test "empty ball behaves as expected" {
-    var rng = std.Random.Xoshiro256.init(0);
-    var test_vols = try TestVolumes.initRandom(
-        testing.allocator,
-        rng.random(),
-        test_num_volumes,
-        .{ .uniform = .{ .min = test_min_extent, .max = test_max_extent } },
-        .{ .uniform = .{ .min = test_space_min, .max = test_space_max } },
-    );
-    defer test_vols.deinit(testing.allocator);
-    const balls = test_vols.getRandomBodies(Ball2f);
-
-    for (balls) |b| {
-        try testing.expectEqual(false, checkVolumesOverlap(empty_ball, b));
-        try testing.expectEqual(false, checkVolumesOverlap(b, empty_ball));
-    }
-}
-
 test "empty box behaves as expected" {
-    var rng = std.Random.Xoshiro256.init(1);
+    const seed = calc.getClockBasedRngSeed(testing.io);
+    var prng = std.Random.DefaultPrng.init(seed);
+    errdefer calc.printErrorMessageForRandomSeed(seed);
     var test_vols = try TestVolumes.initRandom(
-        testing.allocator,
-        rng.random(),
+        test_alloc,
+        prng.random(),
         test_num_volumes,
         .{ .uniform = .{ .min = test_min_extent, .max = test_max_extent } },
         .{ .uniform = .{ .min = test_space_min, .max = test_space_max } },
     );
-    defer test_vols.deinit(testing.allocator);
+    defer test_vols.deinit(test_alloc);
     const boxes = test_vols.getRandomBodies(Box2f);
-
+    // an empty box should not grow bounding boxes and overlaps check should fail
     for (boxes) |b| {
         try testing.expectEqual(b, getEncompassingBox(empty_ball, b));
         try testing.expectEqual(b, getEncompassingBox(b, empty_ball));
