@@ -1,14 +1,14 @@
 # Zgrid
 
-Zgrid is a library for 2D spatial data structures that aims to do be three things:
+Zgrid is a library for 2D spatial queries that aims to do be three things:
 - Simple
 - Lightweight
 - Efficient
 
-Currently zgrid only offers one data structure, `SquareTree`, for fast queries in 2D scenes.
-It is tailored to realtime applications where thousands of bodies are fairly uniformly distributed (e.g., life / particle simulators, RPG-/RTS-style games).
-It aims to extend the commonly-used (for good reason!) uniform grid approach in a useful way.
-A square tree won't be suitable for every application, it is likely to be much slower than alternatives for very sparse scenes.
+Currently zgrid only offers one data structure, `SquareTree`, for queries in 2D scenes.
+This data structure is designed for realtime applications where objects are densely packed (e.g., life / particle simulators, RPG-/RTS-style games). 
+With appropriate parameters, it should scale well for 100 - 20,000 objects.
+A square tree won't be suitable for every application, it is likely to be much slower than alternatives for sparse scenes.
 More data structures are planned in future, see the [Roadmap](#roadmap).
 
 ## Prerequisites
@@ -16,11 +16,11 @@ Zig 0.16.
 
 ## Installation
 
-Use `zig fetch` to import the zgrid package to your project:
+Use `zig fetch` to import the zgrid package into your project:
 ``` sh
 zig fetch --save git+https://github.com/cottonears/zgrid
 ```
-Then register it as a dependency of your app in `build.zig.zon`:
+Then register it as a dependency in your `build.zig.zon` file:
 ``` zig
 const zgrid_dep = b.dependency("zgrid", .{
     .target = target,
@@ -30,6 +30,9 @@ exe.root_module.addImport("zgrid", zgrid_dep.module("zgrid"));
 ```
 
 ## Simple working example
+
+This shows how you can create a square tree, populate it, and perform simple spatial queries:
+
 ``` zig
 const std = @import("std");
 const zgrid = @import("zgrid");
@@ -70,11 +73,13 @@ pub fn main(init: std.process.Init) !void {
     const entity_pairs = try tree.findSelfOverlaps(&overlaps_buff);
     for (entity_pairs) |p| {
         std.debug.print("Entity overlap between {d} and {d}.\n", .{ p[0], p[1] });
+
+    // TODO: line segment + kNN example
     }
 }
 ```
 
-There is a companion project [`zgrid-demo`](https://github.com/cottonears/zgrid-demo) that uses zgrid + SDL3 for simple particle simulation.
+There is a companion project [`zgrid-demo`](https://github.com/cottonears/zgrid-demo) that uses zgrid + SDL3 in a simple particle simulation.
 
 
 ## Volumes
