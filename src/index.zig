@@ -7,10 +7,9 @@ const Vec2f = calc.Vec2f;
 const Box2f = vol.Box2f;
 
 pub const Curve = enum {
-    Morton, // the 'standard' Lebesgue / Morton curve produced by bit-interleaving
-    Spiral,
-    Spring, // identical to Z for base = 2, but stretches for higher bases
-    U, // looks like this: |_|
+    // TODO: add support for Hilbert curves!
+    Morton, // the standard Lebesgue / Morton Z-shaped curve produced by bit-interleaving
+    Spring, // same Z-shape as Morton for base = 2, but stretches for higher bases
     Zigzag, // fancy
 
     const morton2_index_map = [2][2]u4{
@@ -18,30 +17,11 @@ pub const Curve = enum {
         .{ 2, 3 },
     };
 
-    const u2_index_map = [2][2]u4{
-        .{ 0, 3 },
-        .{ 1, 2 },
-    };
-
-    const u4_index_map = [4][4]u4{
-        .{ 0x0, 0x3, 0xC, 0xF },
-        .{ 0x1, 0x2, 0xD, 0xE },
-        .{ 0x4, 0x7, 0x8, 0xA },
-        .{ 0x5, 0x6, 0x9, 0xB },
-    };
-
     const morton4_index_map = [4][4]u4{
         .{ 0x0, 0x1, 0x4, 0x5 },
         .{ 0x2, 0x3, 0x6, 0x7 },
         .{ 0x8, 0x9, 0xC, 0xD },
         .{ 0xA, 0xB, 0xE, 0xF },
-    };
-
-    const spiral4_index_map = [4][4]u4{
-        .{ 0x0, 0x1, 0x2, 0x3 },
-        .{ 0xB, 0xC, 0xD, 0x4 },
-        .{ 0xA, 0xF, 0xE, 0x5 },
-        .{ 0x9, 0x8, 0x7, 0x6 },
     };
 
     const spring4_index_map = [4][4]u4{
@@ -59,14 +39,9 @@ pub const Curve = enum {
     };
 
     fn getCurveIndexMap(comptime n: comptime_int, comptime curve: Curve) [n][n]u4 {
-        // TODO: can this be cleaned up with a tagged union?
         return switch (curve) {
             .Morton => if (n == 2) morton2_index_map else morton4_index_map,
             .Spring => if (n == 2) morton2_index_map else spring4_index_map,
-            .U => if (n == 2) u2_index_map else u4_index_map,
-            .Spiral => if (n == 4) spiral4_index_map else {
-                @compileError("spiral only supports base 4");
-            },
             .Zigzag => if (n == 4) zigzag4_index_map else {
                 @compileError("zigzag only supports base 4");
             },
@@ -111,13 +86,12 @@ pub fn Indexer2f(
         }
 
         pub const CurveIndex = math.IntFittingRange(0, num_leaves - 1);
-        pub const LevelIndex = math.IntFittingRange(0, depth - 1); // 0 = top level (coarsest grid)
+        pub const LevelIndex = math.IntFittingRange(0, depth - 1); // 0 = top level
         pub const base = subdivs_per_axis;
         pub const curve = curve_type;
         pub const top_levels = top_lvl_compression;
         pub const depth = 1 + regular_levels;
         pub const effective_depth = top_lvl_compression + regular_levels;
-        // level 0 spans top_levels subdivisions; every level below it spans one
         pub const nodes_in_level = calc.getPow2nSequence(base, top_levels, effective_depth);
         pub const num_children = base * base;
         pub const num_leaves = nodes_in_level[depth - 1];
@@ -142,19 +116,56 @@ pub fn Indexer2f(
         const GridCoords = struct { row: GridIndex, col: GridIndex };
         const Self = @This();
 
-        /// Gets the position index of a leaf node's predecessor at the identified level.
-        pub fn getLeafPredecessor(leaf_index: CurveIndex, level: LevelIndex) CurveIndex {
-            return leaf_index >> leafShiftToLevel(level);
-        }
-
         /// Gets the position index of the first child node, one level below the parent.
         pub fn getFirstChild(parent_pos: CurveIndex) CurveIndex {
             return parent_pos <<| lvl_bitshift;
         }
 
+        /// Gets the position index of the first leaf successor of the parent.
+        pub fn getFirstLeafSuccessor(lvl: LevelIndex, node: CurveIndex) CurveIndex {
+            return node <<| leafShiftToLevel(lvl);
+        }
+
+        /// Gets the number of leaf successors below a node at the specified level.
+        pub fn getNumberLeafSuccessors(lvl: LevelIndex) usize {
+            return @as(CurveIndex, 1) <<| leafShiftToLevel(lvl);
+        }
+
+        /// Gets the position index of a leaf node's predecessor at the identified level.
+        pub fn getLeafPredecessor(leaf_index: CurveIndex, level: LevelIndex) CurveIndex {
+            return leaf_index >> leafShiftToLevel(level);
+        }
+
+        /// Gets the row + column number for the provided index.
+        /// Map from curve index -> grid coords.
+        fn getGridCoordsForIndex(leaf_index: CurveIndex) GridCoords {
+            var row: GridIndex = 0;
+            var col: GridIndex = 0;
+            inline for (0..effective_depth) |i| {
+                const lvl_diff = effective_depth - i - 1;
+                const index_i = (leaf_index >> lvl_diff * lvl_bitshift) & (num_children - 1);
+                const grid_coords = grid_coord_map[index_i];
+                row = (row << axis_bitshift) + @as(GridIndex, @truncate(grid_coords[0]));
+                col = (col << axis_bitshift) + @as(GridIndex, @truncate(grid_coords[1]));
+            }
+            return .{ .row = row, .col = col };
+        }
+
+        /// Gets the curve index for the provided point in the leaf-level grid.
+        /// Map from grid coords -> curve index.
+        fn getIndexForGridCoords(comptime digits: u8, c: GridCoords) CurveIndex {
+            var index: CurveIndex = 0;
+            inline for (0..digits) |i| {
+                const lvl_diff = digits - i - 1;
+                const lvl_row = (c.row >> axis_bitshift * lvl_diff) & (base - 1);
+                const lvl_col = (c.col >> axis_bitshift * lvl_diff) & (base - 1);
+                const index_i: CurveIndex = @intCast(index_map[lvl_row][lvl_col]);
+                index = (index << lvl_bitshift) + index_i;
+            }
+            return index;
+        }
+
         /// Gets the bitshift required to move a leaf index up to the identified level.
-        /// From the zig language reference operator table for `a << b`:
-        /// "b must be comptime-known or have a type with log2 number of bits of a"
         fn leafShiftToLevel(level: LevelIndex) math.Log2Int(CurveIndex) {
             const lvl_diff = @as(LevelIndex, @truncate(depth - 1)) - level;
             return @truncate(lvl_diff * lvl_bitshift);
@@ -162,8 +173,8 @@ pub fn Indexer2f(
 
         /// A bounding square (not a rectangle) is fit around the provided corner points.
         pub fn init(corner_1: Vec2f, corner_2: Vec2f) !Self {
-            const min_pt: Vec2f = @min(corner_1, corner_2);
-            const max_pt: Vec2f = @max(corner_1, corner_2);
+            const min_pt = @min(corner_1, corner_2);
+            const max_pt = @max(corner_1, corner_2);
             const size = @max(max_pt[0] - min_pt[0], max_pt[1] - min_pt[1]);
             if (size <= 0.0) return error.InvalidSize;
             var lvl_size = size;
@@ -202,7 +213,7 @@ pub fn Indexer2f(
         /// Map from index space -> grid coords -> cell extents (subsets of R^2).
         pub fn getLeafCellBoundary(self: *const Self, leaf_index: CurveIndex) Box2f {
             const grid_coords = getGridCoordsForIndex(leaf_index);
-            const min = self.gitMinForGridCoords(grid_coords);
+            const min = self.getMinForGridCoords(grid_coords);
             return .{ .min = min, .max = min + @as(Vec2f, @splat(self.cell_size)) };
         }
 
@@ -211,7 +222,7 @@ pub fn Indexer2f(
             const first_leaf = index << leafShiftToLevel(level);
             const grid_coords = getGridCoordsForIndex(first_leaf);
             const side_len = self.cell_size * level_scales[level];
-            const min = self.gitMinForGridCoords(grid_coords);
+            const min = self.getMinForGridCoords(grid_coords);
             return .{ .min = min, .max = min + @as(Vec2f, @splat(side_len)) };
         }
 
@@ -265,7 +276,7 @@ pub fn Indexer2f(
         }
 
         /// Gets the min corner of the identified cell.
-        fn gitMinForGridCoords(self: *const Self, gc: GridCoords) Vec2f {
+        fn getMinForGridCoords(self: *const Self, gc: GridCoords) Vec2f {
             return .{
                 self.min_pt[0] + gc.col * self.cell_size,
                 self.min_pt[1] + gc.row * self.cell_size,
@@ -286,35 +297,6 @@ pub fn Indexer2f(
             const gc = self.getGridCoordsForPoint(point);
             const shift = axis_bitshift * regular_levels;
             return .{ .row = gc.row >> shift, .col = gc.col >> shift };
-        }
-
-        /// Gets the curve index for the provided point in the leaf-level grid.
-        /// Map from grid coords -> curve index.
-        fn getIndexForGridCoords(comptime digits: u8, c: GridCoords) CurveIndex {
-            var index: CurveIndex = 0;
-            inline for (0..digits) |i| {
-                const lvl_diff = digits - i - 1;
-                const lvl_row = (c.row >> axis_bitshift * lvl_diff) & (base - 1);
-                const lvl_col = (c.col >> axis_bitshift * lvl_diff) & (base - 1);
-                const index_i: CurveIndex = @intCast(index_map[lvl_row][lvl_col]);
-                index = (index << lvl_bitshift) + index_i;
-            }
-            return index;
-        }
-
-        /// Gets the row + column number for the provided index.
-        /// Map from curve index -> grid coords.
-        fn getGridCoordsForIndex(leaf_index: CurveIndex) GridCoords {
-            var row: GridIndex = 0;
-            var col: GridIndex = 0;
-            inline for (0..effective_depth) |i| {
-                const lvl_diff = effective_depth - i - 1;
-                const index_i = (leaf_index >> lvl_diff * lvl_bitshift) & (num_children - 1);
-                const grid_coords = grid_coord_map[index_i];
-                row = (row << axis_bitshift) + @as(GridIndex, @truncate(grid_coords[0]));
-                col = (col << axis_bitshift) + @as(GridIndex, @truncate(grid_coords[1]));
-            }
-            return .{ .row = row, .col = col };
         }
     };
 }
@@ -344,25 +326,47 @@ test "check coord map lookups are 1:1" {
     }
 }
 
+test "hexa tree indexing" {
+    const Indexer = Indexer2f(4, 1, 1, Curve.Spring);
+    var hex_indexer = try Indexer.init(.{ 0, 0 }, .{ 8, 8 });
+    const pt_a = Vec2f{ 4.1, 2.1 };
+    const index_a = hex_indexer.getLeafIndexForPoint(pt_a);
+    const parent_a = Indexer.getLeafPredecessor(index_a, 0);
+    try testing.expectEqual(96, index_a);
+    try testing.expectEqual(6, parent_a);
+    const pt_b = Vec2f{ 7.99, 7.99 };
+    const index_b = hex_indexer.getLeafIndexForPoint(pt_b);
+    try testing.expectEqual(Indexer.num_leaves - 1, index_b);
+
+    for (0..Indexer.num_leaves) |i| {
+        const index: Indexer.CurveIndex = @intCast(i);
+        const parent_index = Indexer.getLeafPredecessor(index, 0);
+        const parent_child0 = Indexer.getFirstChild(parent_index);
+        // ancestors can be identified by the MSBs of the child index
+        try testing.expectEqual(index / 16, parent_index);
+        try testing.expect(@abs(index - parent_child0) < 16);
+    }
+}
+
 test "quad tree indexing" {
-    const QuadIndexer = Indexer2f(2, 1, 2, Curve.Morton);
-    var qt = try QuadIndexer.init(Vec2f{ 0, 0 }, Vec2f{ 8, 8 });
+    const Indexer = Indexer2f(2, 1, 2, Curve.Morton);
+    var quad_indexer = try Indexer.init(.{ 0, 0 }, .{ 8, 8 });
     const pt_a = Vec2f{ 4.1, 4.1 };
-    const index_a = qt.getLeafIndexForPoint(pt_a);
-    const parent_a = QuadIndexer.getLeafPredecessor(index_a, 1);
-    const grandparent_a = QuadIndexer.getLeafPredecessor(index_a, 0);
+    const index_a = quad_indexer.getLeafIndexForPoint(pt_a);
+    const parent_a = Indexer.getLeafPredecessor(index_a, 1);
+    const grandparent_a = Indexer.getLeafPredecessor(index_a, 0);
     try testing.expectEqual(48, index_a);
     try testing.expectEqual(12, parent_a);
     try testing.expectEqual(3, grandparent_a);
     const pt_b = Vec2f{ 7.99, 7.99 };
-    const ln_num_b = qt.getLeafIndexForPoint(pt_b);
-    try testing.expectEqual(QuadIndexer.num_leaves - 1, ln_num_b);
+    const ln_num_b = quad_indexer.getLeafIndexForPoint(pt_b);
+    try testing.expectEqual(Indexer.num_leaves - 1, ln_num_b);
 
-    for (0..QuadIndexer.num_leaves) |i| {
-        const index: QuadIndexer.CurveIndex = @intCast(i);
-        const pred_2 = QuadIndexer.getLeafPredecessor(index, 2);
-        const pred_1 = QuadIndexer.getLeafPredecessor(index, 1);
-        const pred_0 = QuadIndexer.getLeafPredecessor(index, 0);
+    for (0..Indexer.num_leaves) |i| {
+        const index: Indexer.CurveIndex = @intCast(i);
+        const pred_2 = Indexer.getLeafPredecessor(index, 2);
+        const pred_1 = Indexer.getLeafPredecessor(index, 1);
+        const pred_0 = Indexer.getLeafPredecessor(index, 0);
         // ancestors can be identified by the MSBs of the child index
         try testing.expectEqual(index, pred_2); // same level pred = node
         try testing.expectEqual(index / 4, pred_1);
@@ -370,25 +374,46 @@ test "quad tree indexing" {
     }
 }
 
-test "hexa tree indexing" {
-    const HexaIndexer = Indexer2f(4, 1, 1, Curve.Spring);
-    var tree = try HexaIndexer.init(Vec2f{ 0, 0 }, Vec2f{ 8, 8 });
-    const pt_a = Vec2f{ 4.1, 2.1 };
-    const index_a = tree.getLeafIndexForPoint(pt_a);
-    const parent_a = HexaIndexer.getLeafPredecessor(index_a, 0);
-    try testing.expectEqual(96, index_a);
-    try testing.expectEqual(6, parent_a);
-    const pt_b = Vec2f{ 7.99, 7.99 };
-    const index_b = tree.getLeafIndexForPoint(pt_b);
-    try testing.expectEqual(HexaIndexer.num_leaves - 1, index_b);
-
-    for (0..HexaIndexer.num_leaves) |i| {
-        const index: HexaIndexer.CurveIndex = @intCast(i);
-        const parent_index = HexaIndexer.getLeafPredecessor(index, 0);
-        const parent_child0 = HexaIndexer.getFirstChild(parent_index);
-        // ancestors can be identified by the MSBs of the child index
-        try testing.expectEqual(index / 16, parent_index);
-        try testing.expect(@abs(index - parent_child0) < 16);
+test "compressed indexing test" {
+    const RegIndexer = Indexer2f(4, 1, 2, Curve.Zigzag);
+    const CompIndexer = Indexer2f(4, 2, 1, Curve.Zigzag);
+    const CurveIndex = RegIndexer.CurveIndex;
+    // same effective depth and curve -> same total leaves in each tree
+    try testing.expectEqual(RegIndexer.num_leaves, CompIndexer.num_leaves);
+    // compression should not affect number of children per node (only the node count on level 0)
+    try testing.expectEqual(RegIndexer.num_children, CompIndexer.num_children);
+    // number of successors under level 0 nodes should be reduced by compression
+    const num_reg_successors = RegIndexer.getNumberLeafSuccessors(0);
+    const num_comp_successors = CompIndexer.getNumberLeafSuccessors(0);
+    try testing.expectEqual(num_reg_successors / RegIndexer.num_children, num_comp_successors);
+    // check every index appears as a successor of a level-0 node in each tree, and order matches
+    var reg_succs = try std.ArrayList(CurveIndex).initCapacity(test_alloc, RegIndexer.num_leaves);
+    defer reg_succs.deinit(test_alloc);
+    for (0..RegIndexer.nodes_in_level[0]) |i| {
+        const reg_start = RegIndexer.getFirstLeafSuccessor(0, @truncate(i));
+        const reg_end = reg_start + RegIndexer.getNumberLeafSuccessors(0);
+        for (reg_start..reg_end) |j| reg_succs.appendAssumeCapacity(@truncate(j));
+    }
+    var comp_succs = try std.ArrayList(CurveIndex).initCapacity(test_alloc, CompIndexer.num_leaves);
+    defer comp_succs.deinit(test_alloc);
+    for (0..CompIndexer.nodes_in_level[0]) |i| {
+        const comp_start = CompIndexer.getFirstLeafSuccessor(0, @truncate(i));
+        const comp_end = comp_start + CompIndexer.getNumberLeafSuccessors(0);
+        for (comp_start..comp_end) |j| comp_succs.appendAssumeCapacity(@truncate(j));
+    }
+    try testing.expectEqualSlices(CurveIndex, reg_succs.items, comp_succs.items);
+    // finally, generate some random points and check their indexes are identical in both trees
+    var reg_indexer = try RegIndexer.init(.{ 0, 0 }, .{ 8, 8 });
+    var comp_indexer = try CompIndexer.init(.{ 0, 0 }, .{ 8, 8 });
+    const seed = calc.getClockBasedRngSeed(testing.io);
+    var prng = std.Random.DefaultPrng.init(seed);
+    errdefer calc.printErrorMessageForRandomSeed(seed);
+    var test_pts: [1000]Vec2f = undefined;
+    calc.ProbDensityFunc.fillVec2f(test_dist, prng.random(), &test_pts);
+    for (test_pts) |p| {
+        const r_idx = reg_indexer.getLeafIndexForPoint(p);
+        const c_idx = comp_indexer.getLeafIndexForPoint(p);
+        try testing.expectEqual(r_idx, c_idx);
     }
 }
 
@@ -398,7 +423,9 @@ test "inter-leaf distances are bounded" {
         Indexer2f(4, 1, 1, Curve.Spring),
         Indexer2f(4, 1, 1, Curve.Zigzag),
     };
-    var prng = std.Random.DefaultPrng.init(0);
+    const seed = calc.getClockBasedRngSeed(testing.io);
+    var prng = std.Random.DefaultPrng.init(seed);
+    errdefer calc.printErrorMessageForRandomSeed(seed);
     var test_pts: [500]Vec2f = undefined;
     calc.ProbDensityFunc.fillVec2f(test_dist, prng.random(), &test_pts);
     const min_pt = Vec2f{ -5, -5 };
@@ -419,7 +446,6 @@ test "inter-leaf distances are bounded" {
             pt_idx_pairs[i] = .{ .index = idx.getLeafIndexForPoint(p), .point = p };
         }
         std.sort.pdq(PointIndexPair, &pt_idx_pairs, {}, PointIndexPair.lessThan);
-
         // measure distance between all points that share a leaf index
         var max_measured_cell_dist: f32 = 0;
         var current_leaf_start: usize = 0;
@@ -439,11 +465,12 @@ test "inter-leaf distances are bounded" {
 test "leaf index round trip" {
     const Indexers = .{
         Indexer2f(2, 1, 2, Curve.Morton),
-        Indexer2f(2, 1, 4, Curve.U),
         Indexer2f(4, 1, 1, Curve.Spring),
         Indexer2f(4, 1, 2, Curve.Zigzag),
     };
-    var prng = std.Random.DefaultPrng.init(0);
+    const seed = calc.getClockBasedRngSeed(testing.io);
+    var prng = std.Random.DefaultPrng.init(seed);
+    errdefer calc.printErrorMessageForRandomSeed(seed);
     var random_pts: [2]Vec2f = undefined;
     calc.ProbDensityFunc.fillVec2f(test_dist, prng.random(), &random_pts);
     const min_pt = Vec2f{ -5, -5 };
@@ -468,12 +495,14 @@ test "leaf index round trip" {
 }
 
 test "check get leaf cell neighbours in centre" {
-    var prng = std.Random.DefaultPrng.init(0);
+    const seed = calc.getClockBasedRngSeed(testing.io);
+    var prng = std.Random.DefaultPrng.init(seed);
+    errdefer calc.printErrorMessageForRandomSeed(seed);
     var random_pts: [100]Vec2f = undefined;
     calc.ProbDensityFunc.fillVec2f(test_dist, prng.random(), &random_pts);
     const Indexer = Indexer2f(4, 1, 1, Curve.Zigzag);
     const indexer = try Indexer.init(.{ -10, -10 }, .{ 10, 10 });
-    // size and values match what is expected
+    // check size and values match what is expected
     for (random_pts) |p| {
         const p_idx = indexer.getLeafIndexForPoint(p);
         const p_gc = indexer.getGridCoordsForPoint(p);
@@ -501,6 +530,7 @@ test "check get leaf cell neighbours near edge" {
     var idx_seen = [_]bool{false} ** Indexer.num_leaves;
     var n_buff: [Indexer.num_leaves]Indexer.CurveIndex = undefined;
     var n: u16 = 0;
+    // search for successive rings of nearby indexes; iterate to cover the whole grid
     while (n <= Indexer.coord_max) : (n += 1) {
         const ring = try Indexer.getLeafCellNeighbours(&n_buff, p_idx, n);
         for (ring) |i| {
@@ -508,19 +538,17 @@ test "check get leaf cell neighbours near edge" {
             const row_diff = if (i_gc.row > p_gc.row) i_gc.row - p_gc.row else p_gc.row - i_gc.row;
             const col_diff = if (i_gc.col > p_gc.col) i_gc.col - p_gc.col else p_gc.col - i_gc.col;
             try testing.expectEqual(n, @max(row_diff, col_diff));
-            try testing.expectEqual(false, idx_seen[i]); // never return same index twice
+            try testing.expectEqual(false, idx_seen[i]); // indexes should be found at most once
             idx_seen[i] = true;
         }
     }
-    // searched across the whole grid: every leaf should be found
+    // every leaf index should have been found at least once
     for (idx_seen) |s| try testing.expectEqual(true, s);
 }
 
 test "draw indexer curves" {
     const Indexers = .{
         Indexer2f(2, 2, 4, Curve.Morton),
-        Indexer2f(2, 2, 4, Curve.U),
-        Indexer2f(4, 1, 2, Curve.Spiral),
         Indexer2f(4, 1, 2, Curve.Spring),
         Indexer2f(4, 1, 2, Curve.Zigzag),
     };
@@ -528,8 +556,7 @@ test "draw indexer curves" {
     const line_style: svg.ShapeStyle = .{ .stroke_width = 2, .stroke_hsl = .{ 90, 60, 40 } };
     const min_pt = Vec2f{ 0, 0 };
     const max_pt = Vec2f{ 1024, 1024 };
-
-    // Draw some pretty pictures of the indexers's curves so they can be eyeballed.
+    // draw some pretty pictures of the indexers' curves so they can be eyeballed.
     inline for (Indexers) |Indexer| {
         const idx = try Indexer.init(min_pt, max_pt);
         var pts: [Indexer.num_leaves]Vec2f = undefined;
@@ -541,7 +568,6 @@ test "draw indexer curves" {
                 curve_lenth += calc.norm(pts[i] - pts[i - 1]);
             }
         }
-
         var test_canvas = try svg.Canvas.init(test_alloc, min_pt, max_pt, bg_style);
         defer test_canvas.deinit(test_alloc);
         try test_canvas.addPolyline(test_alloc, &pts, line_style);
@@ -551,5 +577,6 @@ test "draw indexer curves" {
         try test_canvas.addText(test_alloc, text_loc, length_str, 20, .{ 0, 0, 0 });
         const fpath = try std.fmt.bufPrint(&sbuff, "{s}/{any}.html", .{ test_dir, Indexer });
         try test_canvas.writeHtml(test_alloc, testing.io, fpath, true);
+        // operator should inspect the output: expect("looks good to me")
     }
 }
