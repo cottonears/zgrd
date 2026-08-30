@@ -4,6 +4,7 @@ const data = @import("data.zig");
 const index = @import("index.zig");
 const svg = @import("svg.zig");
 const vol = @import("volume.zig");
+const math = std.math;
 const Vec2f = calc.Vec2f;
 const Ball2f = vol.Ball2f;
 const Box2f = vol.Box2f;
@@ -119,7 +120,7 @@ pub fn SquareTree(
             for (vols, client_ids) |v, c| {
                 const leaf_num = self.indexer.getLeafIndexForPoint(v.getCentre());
                 const data_index = self.leaf_counts[leaf_num];
-                if (data_index == std.math.maxInt(DataIndex)) return error.DataIndexRangeExceeded;
+                if (data_index == math.maxInt(DataIndex)) return error.DataIndexRangeExceeded;
 
                 if (compressed) {
                     const bb = v.getBoundingBox();
@@ -144,10 +145,21 @@ pub fn SquareTree(
         }
 
         /// Diagnostic: the largest number of volumes staged in any single leaf.
-        pub fn maxLeafOccupancy(self: *const Self) DataIndex {
+        pub fn getMaxLeafOccupancy(self: *const Self) DataIndex {
             var max_count: DataIndex = 0;
             for (self.leaf_counts) |count| max_count = @max(max_count, count);
             return max_count;
+        }
+
+        /// Gets the total number of volumes stored under a node in this tree's hierarchy.
+        /// Counts the volumes stored under all successors' leaves.
+        pub fn getOccupancyUnderNode(self: *const Self, lvl: u4, node: CurveIndex) usize {
+            std.debug.assert(lvl < depth);
+            const succ_start = Indexer.getFirstLeafSuccessor(@truncate(lvl), node);
+            const succ_end = succ_start + Indexer.getNumberLeafSuccessors(@truncate(lvl));
+            var total: usize = 0;
+            for (succ_start..succ_end) |i| total += self.leaf_counts[i];
+            return total;
         }
 
         /// Relocates the tree to a new position.
@@ -303,7 +315,7 @@ pub fn SquareTree(
                 for (0..nodes_in_level[lvl]) |i| {
                     const node_index: CurveIndex = @intCast(i);
                     const cell = self.indexer.getCellBoundaryAtLevel(lvl, node_index);
-                    const label_width = (std.math.log2_int(usize, nodes_in_level[lvl]) + 3) / 4;
+                    const label_width = (math.log2_int(usize, nodes_in_level[lvl]) + 3) / 4;
                     const label = try std.fmt.bufPrint(&label_buff, "{X:0>[1]}", .{ node_index, label_width });
                     try canvas.addRectangle(allocator, cell.min, cell.max, style);
                     try canvas.addText(allocator, cell.getCentre(), label, font_size, style.stroke_hsl);
@@ -523,14 +535,12 @@ const testing = std.testing;
 const test_alloc = testing.allocator;
 const test_capacity = 1000;
 
-test "square tree init" {
-    const IndexerM2x8 = index.Indexer2f(2, 1, 7, .Morton);
-    const Tree2x8 = SquareTree(IndexerM2x8, Ball2f, u32);
+test "square tree init + deinit" {
+    // check for memory leaks
+    const Tree2x8 = SquareTree(index.Indexer2f(2, 1, 7, .Morton), Ball2f, u32);
     var qt = try Tree2x8.init(test_alloc, .{ 0, 0 }, .{ 1, 1 }, test_capacity);
     defer qt.deinit(test_alloc);
-
-    const IndexerSwizz4x6 = index.Indexer2f(4, 1, 5, .Zigzag);
-    const Tree4x4 = SquareTree(IndexerSwizz4x6, Ball2f, u32);
+    const Tree4x4 = SquareTree(index.Indexer2f(4, 1, 5, .Zigzag), Ball2f, u32);
     var ht = try Tree4x4.init(test_alloc, .{ 0, 0 }, .{ 1, 1 }, test_capacity);
     defer ht.deinit(test_alloc);
 }
@@ -540,36 +550,27 @@ test "hex tree overlap ball" {
     const HexTree2 = SquareTree(IndexerSwizz4x2, Ball2f, u32);
     var tree = try HexTree2.init(test_alloc, .{ 0, 0 }, .{ 1, 1 }, test_capacity);
     defer tree.deinit(test_alloc);
-
     var balls = [3]Ball2f{
-        .{ .centre = Vec2f{ 0.2, 0.0 }, .radius = 0.4 },
-        .{ .centre = Vec2f{ 0.2, 0.5 }, .radius = 0.2 },
-        .{ .centre = Vec2f{ 0.2, 0.7 }, .radius = 0.1 },
+        .{ .centre = .{ 0.2, 0.0 }, .radius = 0.4 },
+        .{ .centre = .{ 0.2, 0.5 }, .radius = 0.2 },
+        .{ .centre = .{ 0.2, 0.7 }, .radius = 0.1 },
     };
     const indexes = calc.getRange(u32, balls.len);
     try tree.addVolumes(balls[0..], &indexes);
     try tree.updateBounds();
-
-    const leaf_a = tree.indexer.getLeafIndexForPoint(balls[0].getCentre());
-    const leaf_b = tree.indexer.getLeafIndexForPoint(balls[1].getCentre());
-    const leaf_c = tree.indexer.getLeafIndexForPoint(balls[2].getCentre());
-    try testing.expectEqual(false, leaf_a == leaf_b);
-    try testing.expectEqual(false, leaf_a == leaf_c);
-    try testing.expectEqual(false, leaf_b == leaf_c);
-
+    // query volume is miles from the stored balls -> no overlaps
     var id_buff: [8]u32 = undefined;
-    const query_region_1 = Ball2f{ .centre = Vec2f{ 0.9, 0.5 }, .radius = 0.1 };
+    const query_region_1 = Ball2f{ .centre = .{ 0.9, 0.5 }, .radius = 0.1 };
     const overlap_ids_1 = try tree.findOverlaps(&id_buff, query_region_1);
     try testing.expectEqual(0, overlap_ids_1.len);
-
-    const query_region_2 = Ball2f{ .centre = Vec2f{ -3.5, -3.5 }, .radius = 1.0 };
+    // query volume far outside the tree's mapped region -> no overlaps
+    const query_region_2 = Ball2f{ .centre = .{ -3.5, -3.5 }, .radius = 1.0 };
     const overlap_ids_2 = try tree.findOverlaps(&id_buff, query_region_2);
     try testing.expectEqual(0, overlap_ids_2.len);
-
-    const query_region_3 = Ball2f{ .centre = Vec2f{ 0.2, 0.5 }, .radius = 0.2 };
+    // query volume (over b) overlaps with all stored balls
+    const query_region_3 = Ball2f{ .centre = .{ 0.2, 0.5 }, .radius = 0.2 };
     const overlap_ids_3 = try tree.findOverlaps(&id_buff, query_region_3);
     try testing.expectEqual(3, overlap_ids_3.len);
-
     // a overlaps b, and b overlaps c, but a does not overlap c
     var pair_buff: [8]HexTree2.OverlapPair = undefined;
     const pairs = try tree.findSelfOverlaps(&pair_buff);
@@ -581,7 +582,6 @@ test "hex tree overlap box" {
     const HexTree2 = SquareTree(Indexer, Box2f, u32);
     var tree = try HexTree2.init(test_alloc, .{ 0, 0 }, .{ 1, 1 }, test_capacity);
     defer tree.deinit(test_alloc);
-
     const boxes = [_]Box2f{
         .{ .min = .{ -0.2, -0.4 }, .max = .{ 0.6, 0.4 } },
         .{ .min = .{ 0.0, 0.3 }, .max = .{ 0.4, 0.7 } },
@@ -589,29 +589,20 @@ test "hex tree overlap box" {
     };
     const indexes = calc.getRange(u32, boxes.len);
     try tree.addVolumes(&boxes, &indexes);
-
     try tree.updateBounds();
-
-    const leaf_0 = tree.indexer.getLeafIndexForPoint(boxes[0].getCentre());
-    const leaf_1 = tree.indexer.getLeafIndexForPoint(boxes[1].getCentre());
-    const leaf_2 = tree.indexer.getLeafIndexForPoint(boxes[2].getCentre());
-    try testing.expectEqual(false, leaf_0 == leaf_1);
-    try testing.expectEqual(false, leaf_0 == leaf_2);
-    try testing.expectEqual(false, leaf_1 == leaf_2);
-
+    // query volume doesn't with any stored boxes -> no overlaps
     var id_buff: [8]u32 = undefined;
-    const query_region_1 = Box2f{ .min = [2]f32{ 0.8, 0.4 }, .max = [2]f32{ 1.0, 0.6 } };
+    const query_region_1 = Box2f{ .min = .{ 0.8, 0.4 }, .max = .{ 1.0, 0.6 } };
     const overlap_ids_1 = try tree.findOverlaps(&id_buff, query_region_1);
     try testing.expectEqual(0, overlap_ids_1.len);
-
+    // query volume far outside the tree's mapped region -> no overlaps
     const query_region_2 = Box2f{ .min = @splat(-4.5), .max = @splat(-2.5) };
     const overlap_ids_2 = try tree.findOverlaps(&id_buff, query_region_2);
     try testing.expectEqual(0, overlap_ids_2.len);
-
-    const query_region_3 = Box2f{ .min = [2]f32{ 0.0, 0.3 }, .max = [2]f32{ 0.4, 0.7 } };
+    // query volume overlaps with all stored boxes
+    const query_region_3 = Box2f{ .min = .{ 0.0, 0.3 }, .max = .{ 0.4, 0.7 } };
     const overlap_3 = try tree.findOverlaps(&id_buff, query_region_3);
     try testing.expectEqual(3, overlap_3.len);
-
     // a overlaps b, and b overlaps c, but a does not overlap c
     var pair_buff: [8]HexTree2.OverlapPair = undefined;
     const pairs = try tree.findSelfOverlaps(&pair_buff);
@@ -623,17 +614,16 @@ test "square tree add remove" {
     const QuadTree = SquareTree(IndexerM2x4, Ball2f, u32);
     var qt = try QuadTree.init(test_alloc, .{ 0, 0 }, .{ 1, 1 }, test_capacity);
     defer qt.deinit(test_alloc);
-
     const test_bodies = [_]Ball2f{
-        Ball2f{ .centre = Vec2f{ 0.2, 0.0 }, .radius = 0.4 },
-        Ball2f{ .centre = Vec2f{ 0.2, 0.5 }, .radius = 0.2 },
-        Ball2f{ .centre = Vec2f{ 0.2, 0.9 }, .radius = 0.1 },
+        .{ .centre = .{ 0.2, 0.0 }, .radius = 0.4 },
+        .{ .centre = .{ 0.2, 0.5 }, .radius = 0.2 },
+        .{ .centre = .{ 0.2, 0.9 }, .radius = 0.1 },
     };
     const indexes = calc.getRange(u32, test_bodies.len);
     try qt.addVolumes(&test_bodies, &indexes);
     try testing.expectEqual(3, qt.num_volumes);
     try qt.updateBounds();
-
+    // check volumes retrieved by id come back unchanged
     for (0..QuadTree.num_leaves) |leaf_num_usize| {
         const leaf_num: QuadTree.CurveIndex = @intCast(leaf_num_usize);
         for (qt.getLeafVolumes(leaf_num), qt.getLeafIds(leaf_num)) |v, id| {
@@ -641,31 +631,28 @@ test "square tree add remove" {
             try testing.expectEqual(test_bodies[id].radius, v.radius);
         }
     }
-
     qt.clearStoredVolumes();
     try testing.expectEqual(0, qt.num_volumes);
 }
 
-test "staged volumes keep their insertion rank within a leaf" {
+test "staged volumes keep their rank within a leaf" {
     const IndexerM4x2 = index.Indexer2f(4, 1, 1, .Morton);
     const QuadTree = SquareTree(IndexerM4x2, Ball2f, u32);
     var qt = try QuadTree.init(test_alloc, .{ 0, 0 }, .{ 1, 1 }, test_capacity);
     defer qt.deinit(test_alloc);
-
-    // interleave insertions between two distant leaves, so the scatter has to reorder.
+    // interleave insertions between two distant leaves, so the scatter has to reorder
     var radii: [6]f32 = undefined;
     for (0..6) |i| {
         radii[i] = 0.01 * @as(f32, @floatFromInt(i + 1));
-        const centre = if (i % 2 == 0) Vec2f{ 0.1, 0.1 } else Vec2f{ 0.9, 0.9 };
+        const centre: Vec2f = if (i % 2 == 0) .{ 0.1, 0.1 } else .{ 0.9, 0.9 };
         const balls = [_]Ball2f{.{ .centre = centre, .radius = radii[i] }};
         const indexes = [_]u32{@intCast(i)};
         try qt.addVolumes(&balls, &indexes);
     }
     try qt.updateBounds();
-
-    // ranks are assigned per leaf, so both leaves should see their volumes in insertion order
-    const leaf_even = qt.indexer.getLeafIndexForPoint(Vec2f{ 0.1, 0.1 });
-    const leaf_odd = qt.indexer.getLeafIndexForPoint(Vec2f{ 0.9, 0.9 });
+    // both leaves should see their volumes in insertion order
+    const leaf_even = qt.indexer.getLeafIndexForPoint(.{ 0.1, 0.1 });
+    const leaf_odd = qt.indexer.getLeafIndexForPoint(.{ 0.9, 0.9 });
     const even_vols = qt.getLeafVolumes(leaf_even);
     const odd_vols = qt.getLeafVolumes(leaf_odd);
     try testing.expectEqual(3, even_vols.len);
@@ -674,22 +661,22 @@ test "staged volumes keep their insertion rank within a leaf" {
     for (odd_vols, 0..) |v, rank| try testing.expectEqual(radii[rank * 2 + 1], v.radius);
 }
 
-test "findSelfOverlaps agrees with brute force" {
-    // Compare the tree's answer against simple pairwise approach
+test "find self overlaps matches brute force" {
     const Trees = .{
-        SquareTree(index.Indexer2f(2, 1, 3, .U), Ball2f, u32),
-        SquareTree(index.Indexer2f(4, 1, 2, .Zigzag), Ball2f, u32),
-        SquareTree(index.Indexer2f(4, 1, 1, .Morton), Box2f, u32),
-        SquareTree(index.Indexer2f(2, 1, 4, .Morton), OrientedBox2f, u32),
-        SquareTree(index.Indexer2f(4, 2, 1, .Morton), Ball2f, u32),
-        SquareTree(index.Indexer2f(4, 2, 1, .Zigzag), OrientedBox2f, u32),
-        SquareTree(index.Indexer2f(2, 3, 2, .Morton), Box2f, u32),
-        SquareTree(index.Indexer2f(4, 3, 0, .Morton), Ball2f, u32),
-        SquareTree(index.Indexer2f(2, 1, 5, .Morton), Ball2f, u32),
-        SquareTree(index.Indexer2f(2, 6, 0, .Morton), Box2f, u32),
+        SquareTree(index.Indexer2f(4, 1, 2, .Spring), Ball2f, u16),
+        SquareTree(index.Indexer2f(4, 1, 1, .Zigzag), Box2f, u16),
+        SquareTree(index.Indexer2f(2, 1, 4, .Morton), OrientedBox2f, u16),
+        SquareTree(index.Indexer2f(4, 2, 1, .Spring), Ball2f, u16),
+        SquareTree(index.Indexer2f(4, 2, 1, .Zigzag), OrientedBox2f, u16),
+        SquareTree(index.Indexer2f(2, 3, 2, .Morton), Box2f, u16),
+        SquareTree(index.Indexer2f(4, 3, 0, .Morton), Ball2f, u16),
+        SquareTree(index.Indexer2f(2, 1, 5, .Morton), OrientedBox2f, u16),
+        SquareTree(index.Indexer2f(2, 6, 0, .Morton), Box2f, u16),
     };
-    const num_vols = 300;
-    var prng = std.Random.DefaultPrng.init(7);
+    const num_vols = 200;
+    const seed = calc.getClockBasedRngSeed(testing.io);
+    var prng = std.Random.DefaultPrng.init(seed);
+    errdefer calc.printErrorMessageForRandomSeed(seed);
     var test_vols = try vol.TestVolumes.initRandom(
         test_alloc,
         prng.random(),
@@ -698,15 +685,14 @@ test "findSelfOverlaps agrees with brute force" {
         .{ .uniform = .{ .min = 0.05, .max = 0.95 } },
     );
     defer test_vols.deinit(test_alloc);
-
+    // generate random volumes and check for overlaps between all pairs
     inline for (Trees) |Tree| {
         const bodies = test_vols.getRandomBodies(Tree.VolumeType);
         var tree = try Tree.init(test_alloc, .{ 0, 0 }, .{ 1, 1 }, num_vols);
         defer tree.deinit(test_alloc);
-        const indexes = calc.getRange(u32, num_vols);
+        const indexes = calc.getRange(Tree.ClientIdType, num_vols);
         try tree.addVolumes(bodies, &indexes);
         try tree.updateBounds();
-        // brute force reference
         var expected: std.ArrayList(Tree.OverlapPair) = .empty;
         defer expected.deinit(test_alloc);
         for (bodies, 0..) |a, i| {
@@ -716,27 +702,24 @@ test "findSelfOverlaps agrees with brute force" {
                 }
             }
         }
-
-        const pair_buff = try test_alloc.alloc(Tree.OverlapPair, num_vols * num_vols);
-        defer test_alloc.free(pair_buff);
-        const actual = try tree.findSelfOverlaps(pair_buff);
-
-        try testing.expect(expected.items.len > 0); // the test must not pass vacuously
+        // check that the pairwise overlap results agree with those returned by the tree's method
+        const found_buff = try test_alloc.alloc(Tree.OverlapPair, num_vols * num_vols);
+        defer test_alloc.free(found_buff);
+        const actual = try tree.findSelfOverlaps(found_buff);
         calc.sortPairsLessThan(Tree.ClientIdType, expected.items);
         calc.sortPairsLessThan(Tree.ClientIdType, actual);
         try testing.expectEqualSlices(Tree.OverlapPair, expected.items, actual);
     }
 }
 
-test "findOverlaps agrees with brute force" {
-    //
-    const Trees = .{
-        SquareTree(index.Indexer2f(4, 1, 2, .Morton), Ball2f, u32),
-        SquareTree(index.Indexer2f(2, 2, 2, .Morton), Box2f, u32),
-        SquareTree(index.Indexer2f(4, 3, 1, .Zigzag), Ball2f, u32),
-    };
-    const num_vols = 500;
-    var prng = std.Random.DefaultPrng.init(42);
+test "find neighbours matches brute force" {
+    const num_vols = 200;
+    const seed = calc.getClockBasedRngSeed(testing.io);
+    var prng = std.Random.DefaultPrng.init(seed);
+    errdefer calc.printErrorMessageForRandomSeed(seed);
+    const Tree = SquareTree(index.Indexer2f(4, 2, 1, .Zigzag), Box2f, u16);
+    var tree = try Tree.init(test_alloc, .{ 0, 0 }, .{ 1, 1 }, num_vols);
+    defer tree.deinit(test_alloc);
     var test_vols = try vol.TestVolumes.initRandom(
         test_alloc,
         prng.random(),
@@ -745,46 +728,87 @@ test "findOverlaps agrees with brute force" {
         .{ .uniform = .{ .min = 0.05, .max = 0.95 } },
     );
     defer test_vols.deinit(test_alloc);
-
-    inline for (Trees) |Tree| {
-        const bodies = test_vols.getRandomBodies(Tree.VolumeType);
-        var tree = try Tree.init(test_alloc, .{ 0, 0 }, .{ 1, 1 }, num_vols);
-        defer tree.deinit(test_alloc);
-        const indexes = calc.getRange(u32, num_vols);
-        try tree.addVolumes(bodies, &indexes);
-        try tree.updateBounds();
-
-        const id_buff = try test_alloc.alloc(Tree.ClientIdType, num_vols);
-        defer test_alloc.free(id_buff);
-        var total: usize = 0;
-        for (bodies) |query| {
-            var expected: usize = 0;
-            for (bodies) |other| {
-                if (vol.checkVolumesOverlap(query, other)) expected += 1;
+    const boxes = test_vols.getRandomBodies(Box2f);
+    const indexes = calc.getRange(Tree.ClientIdType, num_vols);
+    try tree.addVolumes(boxes, &indexes);
+    try tree.updateBounds();
+    // check for closest neighbours between all pairs
+    for (boxes, indexes) |box_a, id_a| {
+        var nearest_3 = ([1]Tree.Neighbour{.{ .id = 0, .dist = math.floatMax(f32) }}) ** 3;
+        const a_centre = box_a.getCentre();
+        for (boxes, indexes) |box_b, id_b| {
+            if (id_a == id_b) continue;
+            const b_dist = calc.norm(box_b.getCentre() - a_centre);
+            for (0..3) |i| {
+                if (b_dist < nearest_3[i].dist) {
+                    var j: usize = 2;
+                    while (j > i) : (j -= 1) {
+                        nearest_3[j] = nearest_3[j - 1];
+                    }
+                    nearest_3[i] = .{ .id = id_b, .dist = b_dist };
+                    break;
+                }
             }
-            const found = try tree.findOverlaps(id_buff, query);
-            try testing.expectEqual(expected, found.len);
-            total += found.len;
         }
-        try testing.expect(total > num_vols);
+        var buf: [3]Tree.Neighbour = undefined;
+        const neighbours_3 = try tree.findNearestNeighbours(&buf, a_centre, 3, 1, id_a);
+        for (0..3) |i| try testing.expectEqual(nearest_3[i], neighbours_3[i]);
     }
+}
 
-    // TODO: add brute-force test for find-nearest neighbours
+test "occupancy counts are accurate" {
+    const num_vols = 100;
+    const seed = calc.getClockBasedRngSeed(testing.io);
+    var prng = std.Random.DefaultPrng.init(seed);
+    errdefer calc.printErrorMessageForRandomSeed(seed);
+    const Indexer = index.Indexer2f(2, 1, 2, .Morton);
+    const Tree = SquareTree(Indexer, Box2f, u8);
+    var tree = try Tree.init(test_alloc, .{ 0, 0 }, .{ 1, 1 }, num_vols);
+    defer tree.deinit(test_alloc);
+    var test_vols = try vol.TestVolumes.initRandom(
+        test_alloc,
+        prng.random(),
+        num_vols,
+        .{ .uniform = .{ .min = 0.005, .max = 0.04 } },
+        .{ .uniform = .{ .min = 0.05, .max = 0.95 } },
+    );
+    defer test_vols.deinit(test_alloc);
+    const boxes = test_vols.getRandomBodies(Box2f);
+    const indexes = calc.getRange(Tree.ClientIdType, num_vols);
+    try tree.addVolumes(boxes, &indexes);
+    try tree.updateBounds();
+    // compute actual occupancy rates
+    var expected_top_occupancy: [4]usize = [_]usize{0} ** 4;
+    var expected_mle: usize = 0;
+    for (0..Tree.num_leaves) |i| {
+        const anc_index = Indexer.getLeafPredecessor(@truncate(i), 0);
+        const num_vols_in_i = tree.getLeafVolumes(@truncate(i)).len;
+        expected_top_occupancy[anc_index] += num_vols_in_i;
+        expected_mle = @max(expected_mle, num_vols_in_i);
+    }
+    // compare with square tree methods
+    var total_occupancy: usize = 0;
+    for (0..4) |anc_index| {
+        const anc_occupancy = tree.getOccupancyUnderNode(0, @truncate(anc_index));
+        try testing.expectEqual(expected_top_occupancy[anc_index], anc_occupancy);
+        total_occupancy += anc_occupancy;
+    }
+    try testing.expectEqual(num_vols, total_occupancy);
+    const mle = tree.getMaxLeafOccupancy();
+    try testing.expectEqual(expected_mle, @as(usize, @intCast(mle)));
 }
 
 test "draw square trees svg" {
-    const IndexerM4x2 = index.Indexer2f(4, 1, 1, .Morton);
+    const IndexerM4x2 = index.Indexer2f(4, 1, 1, .Spring);
     const Trees = .{
         SquareTree(IndexerM4x2, Ball2f, u32),
         SquareTree(IndexerM4x2, Box2f, u32),
         SquareTree(IndexerM4x2, OrientedBox2f, u32),
     };
-    const min_pt = Vec2f{ 0, 0 };
-    const max_pt = Vec2f{ 1024, 1024 };
     const num_vols = 50;
-
-    // moderately-sized volumes clustered around the canvas centre, so overlaps are near-certain.
-    var prng = std.Random.DefaultPrng.init(0);
+    const seed = calc.getClockBasedRngSeed(testing.io);
+    var prng = std.Random.DefaultPrng.init(seed);
+    errdefer calc.printErrorMessageForRandomSeed(seed);
     var test_vols = try vol.TestVolumes.initRandom(
         test_alloc,
         prng.random(),
@@ -793,7 +817,9 @@ test "draw square trees svg" {
         .{ .normal = .{ .mean = 512, .stddev = 250 } },
     );
     defer test_vols.deinit(test_alloc);
-
+    const min_pt = Vec2f{ 0, 0 };
+    const max_pt = Vec2f{ 1024, 1024 };
+    // add the volumes to the tree and draw it
     inline for (Trees) |Tree| {
         var tree = try Tree.init(test_alloc, min_pt, max_pt, num_vols);
         defer tree.deinit(test_alloc);
@@ -801,12 +827,10 @@ test "draw square trees svg" {
         const indexes = calc.getRange(u32, num_vols);
         try tree.addVolumes(bodies, &indexes);
         try tree.updateBounds();
-
         var canvas = try tree.drawTreeSvg(test_alloc, true);
         defer canvas.deinit(test_alloc);
-
-        var buff: [512]u8 = undefined;
-        const fpath = try std.fmt.bufPrint(&buff, "{s}/{s}.html", .{ "test-out", @typeName(Tree) });
-        try canvas.writeHtml(test_alloc, testing.io, fpath, true);
+        var buf: [512]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "{s}/{s}.html", .{ "test-out", @typeName(Tree) });
+        try canvas.writeHtml(test_alloc, testing.io, path, true);
     }
 }

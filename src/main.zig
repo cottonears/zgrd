@@ -390,6 +390,6 @@ fn benchmarkTree(
     defer allocator.free(stats_str);
     std.debug.print(
         "{s}: max leaf {}, overlaps {}, neighbours {}, ext-overlaps {}, size {}B; times:\n{s}\n",
-        .{ Indexer.type_label, tree.maxLeafOccupancy(), overlaps, neighbours, ext_overlaps, @sizeOf(TreeType), stats_str },
+        .{ Indexer.type_label, tree.getMaxLeafOccupancy(), overlaps, neighbours, ext_overlaps, @sizeOf(TreeType), stats_str },
     );
 }
